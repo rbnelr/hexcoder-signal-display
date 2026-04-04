@@ -1,0 +1,11 @@
+{
+	"name": "hexcoder-signal-display",
+	"version": "0.1.0",
+	"title": "Easy Signal Display",
+	"author": "Hexcoder",
+	"factorio_version": "2.0",
+	"dependencies": [
+		"base >= 2.0.61"
+	],
+	"description": ""
+}
