@@ -33,6 +33,23 @@ end)
 
 local _cached_signals = {}
 
+
+-- examples:
+-- [virtual-signal=signal-deny] [entity=big-biter]  [virtual-signal=signal-B]
+-- [item=metallic-asteroid-chunk] [planet=gleba] [recipe=rocket-part] [fluid=crude-oil]
+-- [item=parameter-2] [item=green-wire] [entity=entity-ghost] [quality=epic]"
+
+local signal2rich_text = {
+	--["item"]="item" -- actually nil in SignalID, so handled via nil check
+	["fluid"]="fluid",
+	["virtual"]="virtual-signal",
+	["entity"]="entity",
+	["recipe"]="recipe",
+	["space-location"]="planet",
+	["asteroid-chunk"]="item", -- TODO: test as these are weird
+	["quality"]="quality"
+}
+
 ---@param id unit_number
 ---@param data DisplayData
 local function update(id, data)
@@ -52,11 +69,7 @@ local function update(id, data)
 	-- In GUI it is limited to 500 chars, the show in alt view is limited to even less (it auto wraps into multiple lines)
 	-- in all of these cases rich text visually breaks
 	
-	-- format:
-	-- if text empty: entire text becomes mixed signals
-	-- or {RG} becomes mixed signals {R} or {G} become their respective signals
-	--
-	local function format_all_signals_text(last_text)
+	local function get_all_signals_text()
 		-- TODO: cache
 		--local r = display.get_circuit_network(defines.wire_connector_id.circuit_red)
 		--local g = display.get_circuit_network(defines.wire_connector_id.circuit_green)
@@ -71,53 +84,21 @@ local function update(id, data)
 		end
 		table.sort(signals, comp_signal)
 		
-		
-		local format = last_text:gsub("{%[color=red%].*%[/color%]}", "{R}")
-		
-		-- examples:
-		-- [virtual-signal=signal-deny] [entity=big-biter]  [virtual-signal=signal-B]
-		-- [item=metallic-asteroid-chunk] [planet=gleba] [recipe=rocket-part] [fluid=crude-oil]
-		-- [item=parameter-2] [item=green-wire] [entity=entity-ghost] [quality=epic]"
-		
-		local signal2rich_text = {
-			--["item"]="item" -- actually nil in SignalID, so handled via nil check
-			["fluid"]="fluid",
-			["virtual"]="virtual-signal",
-			["entity"]="entity",
-			["recipe"]="recipe",
-			["space-location"]="planet",
-			["asteroid-chunk"]="item", -- TODO: test as these are weird
-			["quality"]="quality"
-		}
-		local max_per_line = 4
-		
-		-- length of {[color=red][/color]} = 21
-		local safe_len = 500 - (#format-3) - 21
-		
-		local stext = nil
+		local text = nil
 		for i,s in ipairs(signals) do
-			local new_text = stext and (stext.." ") or "" -- space as list seperator
+			text = text and (text.." ") or "" -- space as list seperator
 			
 			-- rich text is: [item=copper-plate] or for non-normal quality: [item=copper-plate,quality=epic]
 			local sig = s.signal
 			local type = signal2rich_text[sig.type] or "item"
 			if not sig.quality then
-				new_text = string.format("%s[%s=%s] %d", new_text, type,sig.name, s.count)
+				text = string.format("%s[%s=%s] %d", text, type,sig.name, s.count)
 			else
-				new_text = string.format("%s[%s=%s,quality=%s] %d", new_text, type,sig.name,sig.quality, s.count)
+				text = string.format("%s[%s=%s,quality=%s] %d", text, type,sig.name,sig.quality, s.count)
 			end
-			
-			if #new_text > safe_len then
-				goto stop
-			end
-			stext = new_text
 		end
-		::stop::
 		
-		text = format:gsub("{R}", string.format("{[color=red]%s[/color]}", stext or ""))
-		local len = #text
-		
-		return text
+		return text or ""
 	end
 	
 	-- in on_tick display_panel_text will be from last tick, ie the selected message based on its condition has not yet taken into account the current signals
@@ -132,7 +113,15 @@ local function update(id, data)
 			--	m.text = "[]"
 			--end
 			
-			m.text = format_all_signals_text(m.text)
+			m.text = m.text:gsub("{[^{}]*}", string.format("{%s}", get_all_signals_text()), 1)
+			ctrl.set_message(i, m)
+		elseif m.icon then
+			-- replace {} with rich text font to remove ugly {} in display while still allowing user defined text surrounding it
+			local format = m.text:gsub("%[font=default%-bold%].*%[/font%]", "{}")
+			
+			local count = display.get_signal(m.icon, defines.wire_connector_id.circuit_red, defines.wire_connector_id.circuit_green)
+			
+			m.text = format:gsub("{[^{}]*}", string.format("[font=default-bold]%d[/font]", count), 1)
 			ctrl.set_message(i, m)
 		end
 	end
