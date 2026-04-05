@@ -9,18 +9,19 @@ storage = storage
 ---@class DisplayData
 ---@field entity LuaEntity
 
-script.on_event(defines.events.on_gui_opened, function(event)
-	if (event.gui_type == defines.gui_type.entity and
-	  event.entity and event.entity.valid and event.entity.type == "display-panel") then
-		-- register all displays that were opened for now
-		local _, id = script.register_on_object_destroyed(event.entity)
+
+
+local function on_created_or_gui_opened(event)
+	local entity = event.entity or event.destination
+	if entity and entity.valid and entity.type == "display-panel" then
+		local _, id = script.register_on_object_destroyed(entity)
 		
 		local data = storage.displays[id]
 		if not data then
-			storage.displays[id] = { entity=event.entity }
+			storage.displays[id] = { entity=entity }
 		end
 	end
-end)
+end
 
 script.on_event(defines.events.on_object_destroyed, function(event)
 	if event.type == defines.target_type.entity then
@@ -28,11 +29,21 @@ script.on_event(defines.events.on_object_destroyed, function(event)
 	end
 end)
 
--- TODO: display_panel_always_show and display_panel_show_in_chart
--- It think display_panel_always_show means we only need to update if player.selected == display (?)
+for _, event in ipairs({
+	defines.events.on_built_entity,
+	defines.events.on_robot_built_entity,
+	defines.events.on_space_platform_built_entity,
+	defines.events.script_raised_built,
+	defines.events.script_raised_revive,
+	defines.events.on_entity_cloned,
+}) do
+	script.on_event(event, on_created_or_gui_opened, {{filter = "type", type = "radar"}, {filter = "name", name = "radar"}})
+end
+-- catch existing display panels after installing mod (lazy, should do migrations with surface scanning)
+script.on_event(defines.events.on_gui_opened, on_created_or_gui_opened)
 
-local _cached_signals = {}
-
+-- TODO: optimize for updating only close to players
+-- also: display_panel_always_show and display_panel_show_in_chart
 
 -- examples:
 -- [virtual-signal=signal-deny] [entity=big-biter]  [virtual-signal=signal-B]
@@ -46,7 +57,7 @@ local signal2rich_text = {
 	["entity"]="entity",
 	["recipe"]="recipe",
 	["space-location"]="planet",
-	["asteroid-chunk"]="item", -- TODO: test as these are weird
+	["asteroid-chunk"]="item",
 	["quality"]="quality"
 }
 
@@ -61,7 +72,7 @@ local function update(id, data)
 	-- sadly the API does not let us write display_panel_text if connected to circuits (maybe becasue the game itself updates this string later)
 	-- so we have to permanently clobber the message texts/icons in the control behavior instead
 	
-	local ctrl = display.get_control_behavior() ---@as LuaDisplayPanelControlBehavior?
+	local ctrl = display and display.valid and display.get_control_behavior() ---@as LuaDisplayPanelControlBehavior?
 	if not ctrl then return end
 	
 	-- Message text is limited to 500 characters without respecting rich text formatting
@@ -69,20 +80,30 @@ local function update(id, data)
 	-- In GUI it is limited to 500 chars, the show in alt view is limited to even less (it auto wraps into multiple lines)
 	-- in all of these cases rich text visually breaks
 	
-	local function get_all_signals_text()
-		-- TODO: cache
-		--local r = display.get_circuit_network(defines.wire_connector_id.circuit_red)
-		--local g = display.get_circuit_network(defines.wire_connector_id.circuit_green)
-		--
-		--r = r and _cached_signals[r.network_id] or {}
-		--g = g and _cached_signals[g.network_id] or {}
+	-- cache signal text for local displays since they might countain multiple conditions and we have to update all of them
+	-- actually want to customize printing now, so be careful for now
+	--local cached_signal_text
+	local function get_all_signals_text(input)
+		--if cached_signal_text then return cached_signal_text end
 		
 		local signals = display.get_signals(defines.wire_connector_id.circuit_red, defines.wire_connector_id.circuit_green) or {}
+		if not signals then
+			return input:gsub("{[^{}]*}", "{}", 1)
+		end
 		
 		local function comp_signal(l, r)
 			return l.count > r.count
 		end
 		table.sort(signals, comp_signal)
+		
+		-- support fixed point values: /1000f3 => signal=1234567 -> 123.457 (.4567 rounded to .457)
+		-- don't support more variations due to heavy lua regex limitations
+		local divisor, precision = input:match("/(%d+)f(%d+)")
+		local div = tonumber(divisor) or 1
+		local num_format = precision and string.format("%%.%df", precision) or "%d"
+		
+		local form = "%s[%s=%s] "..num_format
+		local formQ = "%s[%s=%s,quality=%s] "..num_format
 		
 		local text = nil
 		for i,s in ipairs(signals) do
@@ -92,13 +113,39 @@ local function update(id, data)
 			local sig = s.signal
 			local type = signal2rich_text[sig.type] or "item"
 			if not sig.quality then
-				text = string.format("%s[%s=%s] %d", text, type,sig.name, s.count)
+				text = string.format(form, text, type,sig.name, s.count/div)
 			else
-				text = string.format("%s[%s=%s,quality=%s] %d", text, type,sig.name,sig.quality, s.count)
+				text = string.format(formQ, text, type,sig.name,sig.quality, s.count/div)
 			end
 		end
+		text = text or ""
 		
-		return text or ""
+		--cached_signal_text = text
+		return input:gsub("{[^{}]*}", string.format("{%s}", text), 1)
+	end
+	local function get_signal_text(input, icon)
+		-- replace {} with rich text font to remove ugly {} in display while still allowing user defined text surrounding it
+		local format = input:gsub("%[font=default%-bold%].*%[/font%]", "{}")
+		
+		local count = display.get_signal(icon, defines.wire_connector_id.circuit_red, defines.wire_connector_id.circuit_green)
+		
+		local divisor, precision = format:match("/(%d+)f(%d+)")
+		local div = tonumber(divisor) or 1
+		local num_format = precision and string.format("[font=default-bold]%%.%df[/font]", precision) or "[font=default-bold]%d[/font]"
+		
+		return format:gsub("{[^{}]*}", string.format(num_format, count / div), 1)
+	end
+	local function get_any_signal_text(input, icon)
+		-- replace {} with rich text font to remove ugly {} in display while still allowing user defined text surrounding it
+		local format = input:gsub("%[font=default%-bold%].*%[/font%]", "{}")
+		
+		local count = display.get_signal(icon, defines.wire_connector_id.circuit_red, defines.wire_connector_id.circuit_green)
+		
+		local divisor, precision = format:match("/(%d+)f(%d+)")
+		local div = tonumber(divisor) or 1
+		local num_format = precision and string.format("[font=default-bold]%%.%df[/font]", precision) or "[font=default-bold]%d[/font]"
+		
+		return format:gsub("{[^{}]*}", string.format(num_format, count / div), 1)
 	end
 	
 	-- in on_tick display_panel_text will be from last tick, ie the selected message based on its condition has not yet taken into account the current signals
@@ -107,22 +154,27 @@ local function update(id, data)
 	--game.print("circuit: ".. serpent.line(r.signals))
 	
 	for i,m in ipairs(ctrl.messages) do
-		if m.icon and m.icon.type == "virtual" and m.icon.name == "signal-everything" then
-			-- convenience feature: its annoying that when connecting circuit to display panel by default it shows nothing
-			--if m.text == "" and m.condition then
-			--	m.text = "[]"
-			--end
-			
-			m.text = m.text:gsub("{[^{}]*}", string.format("{%s}", get_all_signals_text()), 1)
-			ctrl.set_message(i, m)
-		elseif m.icon then
-			-- replace {} with rich text font to remove ugly {} in display while still allowing user defined text surrounding it
-			local format = m.text:gsub("%[font=default%-bold%].*%[/font%]", "{}")
-			
-			local count = display.get_signal(m.icon, defines.wire_connector_id.circuit_red, defines.wire_connector_id.circuit_green)
-			
-			m.text = format:gsub("{[^{}]*}", string.format("[font=default-bold]%d[/font]", count), 1)
-			ctrl.set_message(i, m)
+		if m.icon then
+			if m.icon.type == "virtual" and m.icon.name == "signal-everything" then
+				-- convenience feature: its annoying that when connecting circuit to display panel by default it shows nothing
+				--if m.text == "" and m.condition then
+				--	m.text = "[]"
+				--end
+				
+				m.text = get_all_signals_text(m.text or "")
+				ctrl.set_message(i, m)
+			elseif m.icon.type == "virtual" and m.icon.name == "signal-anything" then
+				-- any configured, game shows some signal, get last tick shown signal
+				-- this is bad? perhaps we can easily determine actually shown signal? like get is it just all_signals[1]?
+				if display.display_panel_icon then
+					m.text = get_signal_text(m.text or "", display.display_panel_icon)
+					ctrl.set_message(i, m)
+				end
+			else
+				-- show configured signal
+				m.text = get_signal_text(m.text or "", m.icon)
+				ctrl.set_message(i, m)
+			end
 		end
 	end
 	
@@ -131,7 +183,6 @@ local function update(id, data)
 end
 
 script.on_event(defines.events.on_tick, function(event)
-	_cached_signals = {}
 	for id, data in pairs(storage.displays) do
 		update(id, data)
 	end
