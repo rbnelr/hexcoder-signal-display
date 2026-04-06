@@ -9,7 +9,9 @@ storage = storage
 ---@class DisplayData
 ---@field entity LuaEntity
 
-
+-- TODO: optimize for updating only close to players !!!
+-- also: display_panel_always_show and display_panel_show_in_chart
+-- TODO: nixie tube style (automatically config which 
 
 local function on_created_or_gui_opened(event)
 	local entity = event.entity or event.destination
@@ -37,13 +39,10 @@ for _, event in ipairs({
 	defines.events.script_raised_revive,
 	defines.events.on_entity_cloned,
 }) do
-	script.on_event(event, on_created_or_gui_opened, {{filter = "type", type = "radar"}, {filter = "name", name = "radar"}})
+	script.on_event(event, on_created_or_gui_opened, {{filter = "type", type = "display-panel"}})
 end
 -- catch existing display panels after installing mod (lazy, should do migrations with surface scanning)
 script.on_event(defines.events.on_gui_opened, on_created_or_gui_opened)
-
--- TODO: optimize for updating only close to players
--- also: display_panel_always_show and display_panel_show_in_chart
 
 -- examples:
 -- [virtual-signal=signal-deny] [entity=big-biter]  [virtual-signal=signal-B]
@@ -61,10 +60,9 @@ local signal2rich_text = {
 	["quality"]="quality"
 }
 
----@param id unit_number
+---@param display LuaEntity
 ---@param data DisplayData
-local function update(id, data)
-	local display = data.entity
+local function update(display, data)
 	-- display.display_panel_text and display.display_panel_icon
 	-- are essentially variables that the player can config if the display is not connect to circuits
 	-- when the display is connected to circuits they can configure circuit conditions
@@ -72,7 +70,7 @@ local function update(id, data)
 	-- sadly the API does not let us write display_panel_text if connected to circuits (maybe becasue the game itself updates this string later)
 	-- so we have to permanently clobber the message texts/icons in the control behavior instead
 	
-	local ctrl = display and display.valid and display.get_control_behavior() ---@as LuaDisplayPanelControlBehavior?
+	local ctrl = display.get_control_behavior() ---@as LuaDisplayPanelControlBehavior?
 	if not ctrl then return end
 	
 	-- Message text is limited to 500 characters without respecting rich text formatting
@@ -155,20 +153,28 @@ local function update(id, data)
 	
 	for i,m in ipairs(ctrl.messages) do
 		if m.icon then
-			if m.icon.type == "virtual" and m.icon.name == "signal-everything" then
-				-- convenience feature: its annoying that when connecting circuit to display panel by default it shows nothing
-				--if m.text == "" and m.condition then
-				--	m.text = "[]"
-				--end
-				
-				m.text = get_all_signals_text(m.text or "")
-				ctrl.set_message(i, m)
-			elseif m.icon.type == "virtual" and m.icon.name == "signal-anything" then
-				-- any configured, game shows some signal, get last tick shown signal
-				-- this is bad? perhaps we can easily determine actually shown signal? like get is it just all_signals[1]?
-				if display.display_panel_icon then
-					m.text = get_signal_text(m.text or "", display.display_panel_icon)
+			if m.icon.type == "virtual" then
+				-- TODO:
+				-- -> consider this: each=showing all signals, everything=showing sum, anything=show anything like vanilla + count
+				if m.icon.name == "signal-everything" then
+					-- convenience feature: its annoying that when connecting circuit to display panel by default it shows nothing
+					--if m.text == "" and m.condition then
+					--	m.text = "[]"
+					--end
+					
+					m.text = get_all_signals_text(m.text or "")
 					ctrl.set_message(i, m)
+				elseif m.icon.name == "signal-each" then
+					
+				elseif m.icon.name == "signal-anything" then
+					-- if any icon is configured, game shows some signal (not sorted by count)
+					-- display.display_panel_icon we read here is from last tick!
+					-- seemingly there is no easy way to ask for the first signal in the sorted list
+					-- this sounds bad, but the count will be 0-tick, only on signal switches is this 1-tick delay, which is probalby fine...
+					if display.display_panel_icon then
+						m.text = get_signal_text(m.text or "", display.display_panel_icon)
+						ctrl.set_message(i, m)
+					end
 				end
 			else
 				-- show configured signal
@@ -182,10 +188,69 @@ local function update(id, data)
 	
 end
 
-script.on_event(defines.events.on_tick, function(event)
-	for id, data in pairs(storage.displays) do
-		update(id, data)
+local function need_update(chart_view, alt_mode, selected, open, entity)
+	if entity == open then
+		return true
 	end
+	if chart_view then
+		return entity.display_panel_show_in_chart
+	else
+		return (entity.display_panel_always_show and alt) or entity == sel
+	end
+end
+local function test_observed_optimization()
+	local margin = 1.15 -- at least try to catch stuff that is slightly off-screen
+	-- unlike many games, zoom is not tied to vertical or horizontal fov/orthographic diameter
+	-- instead at zoom=1 I get 1 tile being drawn at 32 pixels at my specific window resolution, 2 is zoomed in to 1 tile=64
+	local factor = margin*0.5/32
+	
+	for _, player in pairs(game.players) do
+		if not player.connected then goto continue end
+		local chart = player.render_mode == defines.render_mode.chart -- game view or char_zoomed_in render actual entities, chart is map mode
+		local alt = player.game_view_settings.show_entity_info
+		local sel = player.selected -- hovered
+		local open = player.opened
+		--game.print("".. serpent.block(player.render_mode))
+		
+		local half_sizeX = player.display_resolution.width * factor / player.zoom -- can listen to on_player_display_resolution_changed
+		local half_sizeY = player.display_resolution.height * factor / player.zoom
+		
+		local x0 = player.position.x - half_sizeX
+		local x1 = player.position.x + half_sizeX
+		local y0 = player.position.y - half_sizeY
+		local y1 = player.position.y + half_sizeY
+		--rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x0, y= y1 }, color={.2,1,.2}, width=4, surface=player.surface, time_to_live=1 }
+		--rendering.draw_line{ from={ x=x1, y=y0 }, to={ x=x1, y= y1 }, color={.2,1,.2}, width=4, surface=player.surface, time_to_live=1 }
+		--rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x1, y= y0 }, color={.2,1,.2}, width=4, surface=player.surface, time_to_live=1 }
+		--rendering.draw_line{ from={ x=x0, y=y1 }, to={ x=x1, y= y1 }, color={.2,1,.2}, width=4, surface=player.surface, time_to_live=1 }
+		--
+		--game.print("".. serpent.block{ player.display_resolution, player.zoom, half_sizeX })
+		
+		-- simply run entities filtered per player to find entities, this may be expensive, especially in chart mode if most displays have display_panel_show_in_chart=false
+		-- TODO: could query 1 chunk more and cache chart/alt/all entity lists unless player switched chunks! should be really cheap
+		-- alternatively have to scan large list or build accel structure in lua (simple chunk display lists lookup?) -> annoying though
+		-- TODO: actually is is extremely slow!!
+		local displays = player.surface.find_entities_filtered{type="display-panel", name="display-panel", area={{x0,y0}, {x1,y1}}, force=player.force}
+		for _,entity in ipairs(displays) do
+			local data = storage.displays[entity.unit_number]
+			if data then
+				if need_update(chart, alt, sel, open, entity) then
+					update(entity, data)
+				end
+			end
+		end
+		::continue::
+	end
+end
+
+script.on_event(defines.events.on_tick, function(event)
+	--for _, data in pairs(storage.displays) do
+	--	if display and display.valid then
+	--		update(_, data)
+	--	end
+	--end
+	
+	test_observed_optimization()
 end)
 
 local function init(clean)
@@ -202,6 +267,7 @@ script.on_init(function(event)
 	init(true)
 end)
 
-commands.add_command("hexcoder-signal-display-reset", nil, function(command)
-	_reset()
-end)
+-- removed to not clutter up /help
+--commands.add_command("hexcoder-signal-display-reset", nil, function(command)
+--	_reset()
+--end)
