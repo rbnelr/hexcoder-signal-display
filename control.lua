@@ -11,14 +11,14 @@ storage = storage
 ---@field tracked_displays table<unit_number, DisplayData>
 
 ---@class DisplayData
----@field set_convenient_condition_once? boolean -- set condition conveniently once, set to nil afterwards
 ---@field entity LuaEntity
+---@field set_convenient_condition_once? boolean -- set condition conveniently once, set to nil afterwards
+---@field unmodified_messages DisplayPanelMessageDefinition[]
 
 -- example tich text:
 -- [virtual-signal=signal-deny] [entity=big-biter]  [virtual-signal=signal-B]
 -- [item=metallic-asteroid-chunk] [planet=gleba] [recipe=rocket-part] [fluid=crude-oil]
 -- [item=parameter-2] [item=green-wire] [entity=entity-ghost] [quality=epic]"
-
 local SIGNAL2RICH_TEXT = {
 	--["item"]="item" -- actually nil in SignalID, so handled via nil check
 	["fluid"]="fluid",
@@ -31,70 +31,95 @@ local SIGNAL2RICH_TEXT = {
 }
 local ANY_SIGNAL_COND = { first_signal={type="virtual", name="signal-anything"}, constant=0, comparator="≠" }
 
----@param text string
----@returns string
-local function reset_text(text)
-	--text = text:gsub("%[font=default%-bold%].*%[/font%]", "{<not updating>}")
-	text = text:gsub("{[^{}]*}", "{<not updating>}", 1)
-	return text
+
+local function migrate()
+	for _,data in pairs(storage.tracked_displays) do
+		for i,m in ipairs(data.unmodified_messages) do
+			if m.text then
+				local form = m.text:match("(/%d+f%d+)") or ""
+				m.text = m.text:gsub("{[^{}]*}", "{"..form.."}")
+			end
+		end
+	end
 end
 
----@param display LuaEntity
+---@param ctrl LuaDisplayPanelControlBehavior
 ---@returns boolean
-local function has_any_trigger_message(display)
-	local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
-	if ctrl then
-		--for i,m in ipairs(ctrl.messages) do
-		--	if m.text then
-		--		m.text = m.text:gsub("%[font=default%-bold%].*%[/font%]", "{}")
-		--		ctrl.set_message(i, m)
-		--	end
-		--end
-		
-		for _,m in ipairs(ctrl.messages) do
-			if m.icon and m.text then
-				local found = m.text:find("{[^{}]*}")
-				if found then
-					return true
-				end
-			end
+local function has_any_trigger_message(ctrl)
+	for _,m in ipairs(ctrl.messages) do
+		if m.icon and m.text and m.text:find("{[^{}]*}") then
+			return true
 		end
 	end
 	return false
 end
 
--- only update display if actually configured to do anything by adding to and removing from tracked_displays
+-- stop tracking, restore unmodified messages so user can properly edit
 ---@param display LuaEntity
----@param force_track? boolean
-local function update_tracking(display, force_track)
-	-- if user customized display to have any trigger message, display will start updating after gui close
-	-- force tracking while gui is open to have it track immediately, this may break, but should be safe
-	
+local function stop_tracking(display)
 	local id = display.unit_number ---@cast id -nil
-	if force_track or has_any_trigger_message(display) then
-		local data = storage.tracked_displays[id]
-		if not data then
-			local _, id = script.register_on_object_destroyed(display)
-			
-			storage.tracked_displays[id] = {
-				entity=display,
-				set_convenient_condition_once=true
-			}
-		end
-	else
-		-- reset messages to avoid confusion
-		local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
+	local data = storage.tracked_displays[id]
+	if data then
+		local ctrl = display.get_or_create_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
 		if ctrl then
-			for i,m in ipairs(ctrl.messages) do
-				if m.text then
-					m.text = reset_text(m.text or "")
-					ctrl.set_message(i, m)
-				end
-			end
+			ctrl.messages = data.unmodified_messages
 		end
 		
 		storage.tracked_displays[id] = nil
 	end
+end
+-- start or stop updating depending on if any messages contain {}
+---@param display LuaEntity
+local function update_tracking(display)
+	local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior]]
+	if ctrl and has_any_trigger_message(ctrl) then
+		local id = display.unit_number ---@cast id -nil
+		local data = storage.tracked_displays[id]
+		if not data then
+			script.register_on_object_destroyed(display)
+			
+			data = {
+				entity = display,
+				set_convenient_condition_once = true,
+				unmodified_messages = ctrl.messages
+			}
+			storage.tracked_displays[id] = data
+		end
+	else
+		stop_tracking(display)
+	end
+end
+
+script.on_event(defines.events.on_object_destroyed, function(event)
+	if event.type == defines.target_type.entity then
+		storage.tracked_displays[event.useful_id] = nil
+	end
+end)
+
+local has_set_convenient_condition_once
+
+---@param display LuaEntity
+local function tick_gui(display)
+	local id = display.unit_number ---@cast id -nil
+	
+	local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
+	if ctrl then
+		for i,m in ipairs(ctrl.messages) do
+			if m.icon and m.icon.type == "virtual" then
+				-- convenience feature: its annoying that when connecting circuit to display panel by default it shows nothing
+				if has_set_convenient_condition_once == nil and m.text == nil and m.condition == nil then
+					m.text = "{}"
+					m.condition = ANY_SIGNAL_COND
+					ctrl.set_message(i,m)
+				end
+				has_set_convenient_condition_once = true
+			end
+		end
+	end
+end
+
+local function _comp_signal(l, r)
+	return l.count > r.count
 end
 
 ---@param display LuaEntity
@@ -128,13 +153,10 @@ local function update(display, data)
 	---@param count integer
 	---@returns string
 	local function format_count_text(input, count)
-		-- replace {} with rich text font to remove ugly {} in display while still allowing user defined text surrounding it
-		--input = input:gsub("%[font=default%-bold%].*%[/font%]", "{}")
-		
-		local divisor, precision = input:match("/(%d+)f(%d+)")
+		local divisor, precision = input:match("{/(%d+)f(%d+)}")
 		local div = tonumber(divisor) or 1
 		--local num_format = precision and string.format("[font=default-bold]%%.%df[/font]", precision) or "[font=default-bold]%d[/font]"
-		local num_format = precision and string.format("{%%.%df}", precision) or "{%d}"
+		local num_format = precision and string.format("%%.%df", precision) or "%d"
 		
 		return input:gsub("{[^{}]*}", string.format(num_format, count / div), 1)
 	end
@@ -144,7 +166,7 @@ local function update(display, data)
 	local function get_all_signals_sum_text(input)
 		all_signals = all_signals or display.get_signals(defines.wire_connector_id.circuit_red, defines.wire_connector_id.circuit_green)
 		
-		-- Is the the only way to do this
+		-- Is the the only way to do this?
 		local count = 0
 		if all_signals then
 			for _,sig in ipairs(all_signals) do
@@ -162,10 +184,7 @@ local function update(display, data)
 			return input:gsub("{[^{}]*}", "{}", 1)
 		end
 		
-		local function comp_signal(l, r)
-			return l.count > r.count
-		end
-		table.sort(all_signals, comp_signal)
+		table.sort(all_signals, _comp_signal)
 		
 		-- support fixed point values: /1000f3 => signal=1234567 -> 123.457 (.4567 rounded to .457)
 		-- don't support more variations due to heavy lua regex limitations
@@ -191,13 +210,28 @@ local function update(display, data)
 		end
 		text = text or ""
 		
-		return input:gsub("{[^{}]*}", string.format("{%s}", text), 1)
+		return input:gsub("{[^{}]*}", text, 1)
 	end
 	---@param input string
-	---@param icon SignalID?
+	---@returns string, SignalID
+	local function get_any_signal_text(input)
+		all_signals = all_signals or display.get_signals(defines.wire_connector_id.circuit_red, defines.wire_connector_id.circuit_green)
+		
+		if not all_signals or #all_signals == 0 then
+			return {}, ""
+		end
+		
+		table.sort(all_signals, _comp_signal)
+		
+		local signal = all_signals[1]
+		
+		return signal.signal, format_count_text(input, signal.count)
+	end
+	---@param input string
+	---@param icon SignalID
 	---@returns string
 	local function get_signal_text(input, icon)
-		local count = icon and display.get_signal(icon, defines.wire_connector_id.circuit_red, defines.wire_connector_id.circuit_green) or 0
+		local count = display.get_signal(icon, defines.wire_connector_id.circuit_red, defines.wire_connector_id.circuit_green) or 0
 		
 		return format_count_text(input, count)
 	end
@@ -207,44 +241,43 @@ local function update(display, data)
 	
 	local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
 	if ctrl then
-		for i,m in ipairs(ctrl.messages) do
-			if m.icon then
-				if m.icon.type == "virtual" then
-					-- convenience feature: its annoying that when connecting circuit to display panel by default it shows nothing
-					if data.set_convenient_condition_once and m.text == nil and m.condition == nil then
-						m.text = "{}"
-						m.condition = ANY_SIGNAL_COND
-					end
-					data.set_convenient_condition_once = nil -- set once by mod or already changed by player, do not try again
+		for i,m in ipairs(data.unmodified_messages) do
+			local icon = m.icon
+			local text = m.text
+			
+			if icon.name then
+				local virt_name = icon.type == "virtual" and icon.name or nil
+				if virt_name == "signal-everything" then
+					text = get_all_signals_sum_text(text or "")
+				elseif virt_name == "signal-each" then
+					text = get_all_signals_text(text or "")
+				elseif virt_name == "signal-anything" then
+					-- if signal-anything is set, game shows arbitrary signal (not sorted by count)
+					-- entity.display_panel_icon is what signal game chose, but is from last tick!
+					-- could pick one signal ourselves, for example the highest count, but let's rely on the game
+					-- the count will be 0-tick, if the signal switches this will be wrong for 1-tick...
+					--disp_text = get_signal_text(m.text or "", display.display_panel_icon)
 					
-					if m.icon.name == "signal-everything" then
-						m.text = get_all_signals_sum_text(m.text or "")
-					elseif m.icon.name == "signal-each" then
-						m.text = get_all_signals_text(m.text or "")
-					elseif m.icon.name == "signal-anything" then
-						-- if signal-anything is set, game shows arbitrary signal (not sorted by count)
-						-- entity.display_panel_icon is what signal game chose, but is from last tick!
-						-- could pick one signal ourselves, for example the highest count, but let's rely on the game
-						-- the count will be 0-tick, if the signal switches this will be wrong for 1-tick...
-						m.text = get_signal_text(m.text or "", display.display_panel_icon)
-					else
-						-- show virtual signal count
-						m.text = get_signal_text(m.text or "", m.icon)
-					end
+					icon, text = get_any_signal_text(text or "")
 				else
 					-- show signal count
-					m.text = get_signal_text(m.text or "", m.icon)
+					text = get_signal_text(text or "", icon)
 				end
-				
-				ctrl.set_message(i, m)
 			end
+			
+			ctrl.set_message(i, {
+				icon = icon,
+				text = text,
+				condition = m.condition,
+			})
 		end
 	end
 end
 
 local function need_update(chart_view, alt_mode, selected, open, entity)
 	if entity == open then -- update always if gui is open
-		return true
+		--return true
+		assert(false)
 	end
 	if chart_view then
 		return entity.display_panel_show_in_chart -- update if player in chart mode
@@ -297,8 +330,16 @@ local function test_observed_optimization()
 	end
 end
 
+script.on_nth_tick(12, function(event)
+	for _,player in pairs(game.players) do
+		local entity = player.opened_gui_type == defines.gui_type.entity and player.opened or nil --[[@as LuaEntity?]]
+		if entity and entity.valid and entity.type == "display-panel" then
+			tick_gui(entity)
+		end
+	end
+end)
+
 script.on_event(defines.events.on_tick, function(event)
-	if not storage.tracked_displays then return end -- dev
 	--for _, data in pairs(storage.displays) do
 	--	if display and display.valid then
 	--		update(_, data)
@@ -312,7 +353,20 @@ end)
 local function on_entity_event(event)
 	local entity = event.entity or event.destination --[[@as LuaEntity]]
 	if entity and entity.valid and entity.type == "display-panel" then
-		update_tracking(entity, event.name == defines.events.on_gui_opened)
+		update_tracking(entity)
+	end
+end
+local function on_gui_open(event)
+	local entity = event.entity --[[@as LuaEntity]]
+	if entity and entity.valid and entity.type == "display-panel" then
+		stop_tracking(entity)
+	end
+end
+local function on_gui_close(event)
+	local entity = event.entity --[[@as LuaEntity]]
+	if entity and entity.valid and entity.type == "display-panel" then
+		update_tracking(entity)
+		has_set_convenient_condition_once = nil
 	end
 end
 
@@ -326,14 +380,8 @@ for _, event in ipairs({
 }) do
 	script.on_event(event, on_entity_event, {{filter = "type", type = "display-panel"}})
 end
-script.on_event(defines.events.on_gui_opened, on_entity_event)
-script.on_event(defines.events.on_gui_closed, on_entity_event)
-
-script.on_event(defines.events.on_object_destroyed, function(event)
-	if event.type == defines.target_type.entity then
-		storage.tracked_displays[event.useful_id] = nil
-	end
-end)
+script.on_event(defines.events.on_gui_opened, on_gui_open)
+script.on_event(defines.events.on_gui_closed, on_gui_close)
 
 local function init(clean)
 	storage.tracked_displays = {}
@@ -357,4 +405,8 @@ end)
 -- removed to not clutter up /help
 commands.add_command("hexcoder-signal-display-reset", nil, function(command)
 	_reset()
+end)
+
+commands.add_command("hexcoder-signal-display-migrate", nil, function(command)
+	migrate()
 end)
