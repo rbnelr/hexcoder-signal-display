@@ -9,6 +9,7 @@ storage = storage
 
 ---@class ModStorage
 ---@field tracked_displays table<unit_number, DisplayData>
+---@field surfaces table
 
 ---@class DisplayData
 ---@field entity LuaEntity
@@ -32,16 +33,16 @@ local SIGNAL2RICH_TEXT = {
 local ANY_SIGNAL_COND = { first_signal={type="virtual", name="signal-anything"}, constant=0, comparator="≠" }
 
 
-local function migrate()
-	for _,data in pairs(storage.tracked_displays) do
-		for i,m in ipairs(data.unmodified_messages) do
-			if m.text then
-				local form = m.text:match("(/%d+f%d+)") or ""
-				m.text = m.text:gsub("{[^{}]*}", "{"..form.."}")
-			end
-		end
-	end
-end
+--local function migrate()
+--	for _,data in pairs(storage.tracked_displays) do
+--		for i,m in ipairs(data.unmodified_messages) do
+--			if m.text then
+--				local form = m.text:match("(/%d+f%d+)") or ""
+--				m.text = m.text:gsub("{[^{}]*}", "{"..form.."}")
+--			end
+--		end
+--	end
+--end
 
 ---@param ctrl LuaDisplayPanelControlBehavior
 ---@returns boolean
@@ -66,33 +67,81 @@ local function stop_tracking(display)
 		end
 		
 		storage.tracked_displays[id] = nil
+		
+		local surf = storage.surfaces[display.surface_index]
+		if surf then
+			surf.chart[id] = nil
+			surf.alt[id] = nil
+		end
 	end
 end
 -- start or stop updating depending on if any messages contain {}
 ---@param display LuaEntity
-local function update_tracking(display)
-	local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior]]
-	if ctrl and has_any_trigger_message(ctrl) then
-		local id = display.unit_number ---@cast id -nil
-		local data = storage.tracked_displays[id]
-		if not data then
+---@param copy_from? LuaEntity
+local function update_tracking(display, copy_from)
+	local id = display.unit_number ---@cast id -nil
+	
+	local data
+	local ctrl
+	if copy_from then
+		local data_src = storage.tracked_displays[copy_from.unit_number]
+		if data_src then
 			script.register_on_object_destroyed(display)
 			
-			data = {
-				entity = display,
-				set_convenient_condition_once = true,
+			-- copy control behavior
+			ctrl = display.get_or_create_control_behavior() --[[@as LuaDisplayPanelControlBehavior]]
+			if ctrl then
+				ctrl.messages = data_src.unmodified_messages
+			end
+			
+			-- start tracking because copy_from was also tracked
+			local data = {
+				entity = display, sid = display.surface_index,
 				unmodified_messages = ctrl.messages
 			}
 			storage.tracked_displays[id] = data
 		end
 	else
-		stop_tracking(display)
+		ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior]]
+		if ctrl and has_any_trigger_message(ctrl) then
+			data = storage.tracked_displays[id]
+			if not data then
+				script.register_on_object_destroyed(display)
+				
+				data = {
+					entity = display, sid = display.surface_index,
+					unmodified_messages = ctrl.messages
+				}
+				storage.tracked_displays[id] = data
+			end
+		else
+			stop_tracking(display)
+		end
+	end
+	
+	-- update update lists
+	if data then
+		local surf = storage.surfaces[display.surface_index] or { chart={}, alt={} }
+		
+		surf.chart[id] = display.display_panel_show_in_chart and data or nil
+		surf.alt[id] = display.display_panel_always_show and data or nil
+		
+		storage.surfaces[display.surface_index] = surf
 	end
 end
 
 script.on_event(defines.events.on_object_destroyed, function(event)
 	if event.type == defines.target_type.entity then
-		storage.tracked_displays[event.useful_id] = nil
+		local id = event.useful_id
+		local data = storage.tracked_displays[id]
+		if data then
+			local surf = storage.surfaces[data.sid]
+			if surf then
+				surf.chart[id] = nil
+				surf.alt[id] = nil
+			end
+			storage.tracked_displays[id] = nil
+		end
 	end
 end)
 
@@ -100,8 +149,6 @@ local has_set_convenient_condition_once
 
 ---@param display LuaEntity
 local function tick_gui(display)
-	local id = display.unit_number ---@cast id -nil
-	
 	local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
 	if ctrl then
 		for i,m in ipairs(ctrl.messages) do
@@ -252,12 +299,6 @@ local function update(display, data)
 				elseif virt_name == "signal-each" then
 					text = get_all_signals_text(text or "")
 				elseif virt_name == "signal-anything" then
-					-- if signal-anything is set, game shows arbitrary signal (not sorted by count)
-					-- entity.display_panel_icon is what signal game chose, but is from last tick!
-					-- could pick one signal ourselves, for example the highest count, but let's rely on the game
-					-- the count will be 0-tick, if the signal switches this will be wrong for 1-tick...
-					--disp_text = get_signal_text(m.text or "", display.display_panel_icon)
-					
 					icon, text = get_any_signal_text(text or "")
 				else
 					-- show signal count
@@ -274,58 +315,72 @@ local function update(display, data)
 	end
 end
 
-local function need_update(chart_view, alt_mode, selected, open, entity)
-	if entity == open then -- update always if gui is open
-		--return true
-		assert(false)
-	end
-	if chart_view then
-		return entity.display_panel_show_in_chart -- update if player in chart mode
-	else
-		return (entity.display_panel_always_show and alt_mode) or entity == selected -- update if play and panel in alt mode or if hovered
-	end
-end
-local function test_observed_optimization()
-	local margin = 1.15 -- at least try to catch stuff that is slightly off-screen
+local function optimized_update()
+	local margin = 1.10 -- at least try to catch stuff that is slightly off-screen
 	-- unlike many games, zoom is not tied to vertical or horizontal fov/orthographic diameter
 	-- instead at zoom=1 I get 1 tile being drawn at 32 pixels at my specific window resolution, 2 is zoomed in to 1 tile=64
 	local factor = margin*0.5/32
 	
+	-- do not update display twice
+	local updated = {}
+	
 	for _, player in pairs(game.players) do
 		if not player.connected then goto continue end
-		local chart = player.render_mode == defines.render_mode.chart -- game view or char_zoomed_in render actual entities, chart is map mode
-		local alt = player.game_view_settings.show_entity_info
-		local sel = player.selected -- hovered
-		local open = player.opened
-		--game.print("".. serpent.block(player.render_mode))
 		
-		local half_sizeX = player.display_resolution.width * factor / player.zoom -- can listen to on_player_display_resolution_changed
-		local half_sizeY = player.display_resolution.height * factor / player.zoom
+		local surf = storage.surfaces[player.surface_index]
 		
-		local x0 = player.position.x - half_sizeX
-		local x1 = player.position.x + half_sizeX
-		local y0 = player.position.y - half_sizeY
-		local y1 = player.position.y + half_sizeY
-		--rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x0, y= y1 }, color={.2,1,.2}, width=4, surface=player.surface, time_to_live=1 }
-		--rendering.draw_line{ from={ x=x1, y=y0 }, to={ x=x1, y= y1 }, color={.2,1,.2}, width=4, surface=player.surface, time_to_live=1 }
-		--rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x1, y= y0 }, color={.2,1,.2}, width=4, surface=player.surface, time_to_live=1 }
-		--rendering.draw_line{ from={ x=x0, y=y1 }, to={ x=x1, y= y1 }, color={.2,1,.2}, width=4, surface=player.surface, time_to_live=1 }
-		--
-		--game.print("".. serpent.block{ player.display_resolution, player.zoom, half_sizeX })
+		local update_list ---@type table<unit_number, DisplayData>
+		if surf then
+			if player.render_mode == defines.render_mode.chart then -- game view or char_zoomed_in render actual entities, chart is map mode
+				update_list = surf.chart
+			elseif player.game_view_settings.show_entity_info then
+				update_list = surf.alt
+			end
+		end
 		
-		-- simply run entities filtered per player to find entities, this may be expensive, especially in chart mode if most displays have display_panel_show_in_chart=false
-		-- TODO: could query 1 chunk more and cache chart/alt/all entity lists unless player switched chunks! should be really cheap
-		-- alternatively have to scan large list or build accel structure in lua (simple chunk display lists lookup?) -> annoying though
-		-- TODO: actually is is extremely slow!!
-		local displays = player.surface.find_entities_filtered{type="display-panel", area={{x0,y0}, {x1,y1}}, force=player.force}
-		for _,entity in ipairs(displays) do
-			local data = storage.tracked_displays[entity.unit_number]
-			if data then
-				if need_update(chart, alt, sel, open, entity) then
-					update(entity, data)
+		-- update chart or alt mode displays unless player is in non-alt mode
+		if update_list then
+			local half_sizeX = player.display_resolution.width * factor / player.zoom -- can listen to on_player_display_resolution_changed
+			local half_sizeY = player.display_resolution.height * factor / player.zoom
+			
+			local x0 = player.position.x - half_sizeX - 1
+			local x1 = player.position.x + half_sizeX + 1
+			local y0 = player.position.y - half_sizeY - 1
+			local y1 = player.position.y + half_sizeY + 1
+			--rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x0, y= y1 }, color={.2,1,.2}, width=4, surface=player.surface, time_to_live=1 }
+			--rendering.draw_line{ from={ x=x1, y=y0 }, to={ x=x1, y= y1 }, color={.2,1,.2}, width=4, surface=player.surface, time_to_live=1 }
+			--rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x1, y= y0 }, color={.2,1,.2}, width=4, surface=player.surface, time_to_live=1 }
+			--rendering.draw_line{ from={ x=x0, y=y1 }, to={ x=x1, y= y1 }, color={.2,1,.2}, width=4, surface=player.surface, time_to_live=1 }
+			
+			for _, data in pairs(update_list) do
+				local pos = data.entity.position
+				local x = pos.x
+				local y = pos.y
+				if x > x0 and x < x1 and y > y0 and y < y1 then
+					if data and not updated[data] then
+						update(data.entity, data)
+						updated[data] = true
+					end
 				end
 			end
 		end
+		
+		function _update(display)
+			local data = display and display.valid and storage.tracked_displays[display.unit_number] or nil
+			if data and not updated[data] then
+				update(display, data)
+				updated[data] = true
+			end
+		end
+		
+		-- update always if hovered
+		_update(player.selected) -- hovered
+		
+		-- update always if gui opened (actually never since I now 
+		--if player.opened_gui_type == defines.gui_type.entity then
+		--	_update(player.opened) -- open gui
+		--end
+		
 		::continue::
 	end
 end
@@ -339,21 +394,21 @@ script.on_nth_tick(12, function(event)
 	end
 end)
 
-script.on_event(defines.events.on_tick, function(event)
-	--for _, data in pairs(storage.displays) do
-	--	if display and display.valid then
-	--		update(_, data)
-	--	end
-	--end
-	
-	test_observed_optimization()
-end)
+script.on_event(defines.events.on_tick, optimized_update)
+
+---@param e LuaEntity
+---@returns boolean
+local function is_display_planel(e)
+	return e and e.valid and e.type == "display-panel"
+end
 
 -- Start tracking new or existing entities if needed
 local function on_entity_event(event)
 	local entity = event.entity or event.destination --[[@as LuaEntity]]
-	if entity and entity.valid and entity.type == "display-panel" then
-		update_tracking(entity)
+	local source = is_display_planel(event.source) and event.source or nil
+	
+	if is_display_planel(entity) then
+		update_tracking(entity, source)
 	end
 end
 local function on_gui_open(event)
@@ -376,15 +431,45 @@ for _, event in ipairs({
 	defines.events.on_space_platform_built_entity,
 	defines.events.script_raised_built,
 	defines.events.script_raised_revive,
-	defines.events.on_entity_cloned,
+	defines.events.on_entity_cloned, -- source to destination
 }) do
-	script.on_event(event, on_entity_event, {{filter = "type", type = "display-panel"}})
+	script.on_event(event, on_entity_event, {{filter="type", type="display-panel"}})
 end
+script.on_event(defines.events.on_entity_settings_pasted, on_entity_event) -- source to destination
 script.on_event(defines.events.on_gui_opened, on_gui_open)
 script.on_event(defines.events.on_gui_closed, on_gui_close)
 
+-- blueprinting over does not work like always
+script.on_event(defines.events.on_player_setup_blueprint, function(event)
+	local player = game.get_player(event.player_index) ---@cast player -nil
+	local blueprint = event.stack
+	if not blueprint or not blueprint.valid_for_read then blueprint = player.blueprint_to_setup end
+	if not blueprint or not blueprint.valid_for_read then blueprint = player.cursor_stack end
+	if not blueprint or not blueprint.valid_for_read then return end
+	
+	local entities = blueprint.get_blueprint_entities()
+	local mapping = nil
+	if not entities then return end
+	local changed = false
+	
+	for i, bp_entity in pairs(entities) do
+		if bp_entity.name == "display-panel" then
+			mapping = mapping or event.mapping.get() --[[@as LuaEntity[] ]]
+			local data = storage.tracked_displays[mapping[i].unit_number]
+			if data then
+				bp_entity.control_behavior.parameters = data.unmodified_messages
+			end
+			changed = true
+		end
+	end
+	if changed then
+		blueprint.set_blueprint_entities(entities)
+	end
+end)
+
 local function init(clean)
 	storage.tracked_displays = {}
+	storage.surfaces = {}
 	
 	if not clean then
 		for _, surface in pairs(game.surfaces) do
@@ -395,6 +480,10 @@ local function init(clean)
 	end
 end
 local function _reset()
+	for _,data in pairs(storage.tracked_displays) do
+		stop_tracking(data.entity)
+	end
+
 	storage = {}
 	init(false)
 end
@@ -407,6 +496,6 @@ commands.add_command("hexcoder-signal-display-reset", nil, function(command)
 	_reset()
 end)
 
-commands.add_command("hexcoder-signal-display-migrate", nil, function(command)
-	migrate()
-end)
+--commands.add_command("hexcoder-signal-display-migrate", nil, function(command)
+--	migrate()
+--end)
