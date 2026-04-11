@@ -60,7 +60,7 @@ local function make_phantom(thing)
 end
 
 local ac = util.table.deepcopy(data.raw["arithmetic-combinator"]["arithmetic-combinator"])
-ac.name = mod_name.."ac"
+ac.name = mod_name.."hidden-change-detector"
 ac.energy_source = { type = "void" }
 make_phantom(ac)
 
