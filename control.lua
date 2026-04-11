@@ -13,6 +13,8 @@ storage = storage
 
 ---@class ModStorage
 ---@field tracked_displays table<unit_number, DisplayData>
+---@field polling_displays DisplayData[]
+---@field polling_displays_cur integer
 ---@field surfaces table
 
 ---@class DisplayData
@@ -20,6 +22,8 @@ storage = storage
 ---@field set_convenient_condition_once? boolean -- set condition conveniently once, set to nil afterwards
 ---@field unmodified_messages DisplayPanelMessageDefinition[]
 ---@field acs LuaEntity[]
+---@field active_acs LuaEntity[]
+---@field poll_idx integer
 
 local W = defines.wire_connector_id
 local HIDDEN = defines.wire_origin.script
@@ -63,6 +67,21 @@ local AC_NEGATE_EACH_G = { ---@type ArithmeticCombinatorParameters
 --	end
 --end
 
+local function add_to_poll_list(data)
+	assert(data.poll_idx == nil)
+	data.poll_idx = #storage.polling_displays+1
+	storage.polling_displays[data.poll_idx] = data
+end
+local function remove_from_poll_list(data)
+	-- delete by swap with last
+	local idx = data.poll_idx
+	data.poll_idx = nil
+	local last = #storage.polling_displays
+	storage.polling_displays[idx] = storage.polling_displays[last]
+	storage.polling_displays[idx].poll_idx = idx
+	storage.polling_displays[last] = nil
+end
+
 ---@param ctrl LuaDisplayPanelControlBehavior
 ---@returns boolean
 local function has_any_trigger_message(ctrl)
@@ -75,21 +94,23 @@ local function has_any_trigger_message(ctrl)
 end
 
 -- stop tracking, restore unmodified messages so user can properly edit
----@param display LuaEntity
-local function stop_tracking(display)
-	local id = display.unit_number ---@cast id -nil
+---@param id unit_number
+---@param display? LuaEntity
+local function stop_tracking(id, display)
 	local data = storage.tracked_displays[id]
 	if data then
 		for _,ac in pairs(data.acs) do
 			ac.destroy()
 		end
 		
-		local ctrl = display.get_or_create_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
+		local ctrl = display and display.get_or_create_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
 		if ctrl then
 			ctrl.messages = data.unmodified_messages
 		end
 		
-		local surf = storage.surfaces[display.surface_index]
+		remove_from_poll_list(data)
+		
+		local surf = storage.surfaces[data.sid]
 		if surf then
 			surf.chart[id] = nil
 			surf.alt[id] = nil
@@ -129,7 +150,7 @@ local function update_tracking(display, copy_from)
 			storage.tracked_displays[id] = data
 		end
 	else
-		stop_tracking(display)
+		stop_tracking(id, display)
 	end
 	
 	-- update update lists
@@ -140,6 +161,8 @@ local function update_tracking(display, copy_from)
 		surf.alt[id] = display.display_panel_always_show and data or nil
 		
 		storage.surfaces[display.surface_index] = surf
+		
+		add_to_poll_list(data)
 		
 		if not data.acs then
 			local function make_combinator(x,y, params)
@@ -157,6 +180,7 @@ local function update_tracking(display, copy_from)
 				make_combinator(-0.4, -1.5, AC_NEGATE_EACH_R),
 				make_combinator(0.4, -1.5, AC_NEGATE_EACH_G),
 			}
+			data.active_acs = {}
 			
 			local acR = data.acs[1].get_wire_connectors(true)
 			local acG = data.acs[2].get_wire_connectors(true)
@@ -172,20 +196,7 @@ end
 
 script.on_event(defines.events.on_object_destroyed, function(event)
 	if event.type == defines.target_type.entity then
-		local id = event.useful_id
-		local data = storage.tracked_displays[id]
-		if data then
-			for _,ac in pairs(data.acs) do
-				ac.destroy()
-			end
-			
-			local surf = storage.surfaces[data.sid]
-			if surf then
-				surf.chart[id] = nil
-				surf.alt[id] = nil
-			end
-			storage.tracked_displays[id] = nil
-		end
+		stop_tracking(event.useful_id --[[@as unit_number]])
 	end
 end)
 
@@ -228,7 +239,7 @@ local _changed
 
 ---@param display LuaEntity
 ---@param data DisplayData
-local function update(display, data, newly_revealed)
+local function update(display, data)
 	-- display.display_panel_text and display.display_panel_icon
 	-- are essentially variables that the player can config if the display is not connect to circuits
 	-- when the display is connected to circuits they can configure circuit conditions
@@ -249,13 +260,6 @@ local function update(display, data, newly_revealed)
 	-- for example so that if the user uses multiple messages with conditions if all of them try to show the same signals, I only compute them once
 	-- however I don't tend to use this so I don't bother for now
 	-- I guess caching by actually just not updating displays with unchanged signals would be far better?
-	
-	-- Cool optimization: edge detector AC, read combined inputs (current + negated_previous tick signals) if get_signals()=nil, then no change
-	-- TODO: could try cache if R and G are actually connected and avoid one of these reads most of the time
-	-- newly_revealed: Need to track which checks were skipped by player optimization, since we might miss changes older that last tick
-	if not newly_revealed and data.acs[1].get_signals(CR, CG) == nil and data.acs[2].get_signals(CR, CG) == nil then
-		return
-	end
 	
 	--if dbg then _dbg_update(display) end
 	
@@ -383,8 +387,6 @@ local function update(display, data, newly_revealed)
 	--_changed = _changed + 1
 end
 
-local seen_last_tick = {}
-
 --[[
 local function optimized_update()
 	local margin = 1.10 -- at least try to catch stuff that is slightly off-screen
@@ -484,8 +486,44 @@ local function optimized_update()
 end
 ]]
 
+---@param data DisplayData
+local function poll_display(data)
+	data.active_acs = {}
+	local conn1 = data.entity.get_wire_connector(defines.wire_connector_id.circuit_red, false)
+	local conn2 = data.entity.get_wire_connector(defines.wire_connector_id.circuit_green, false)
+	if conn1 and conn1.real_connection_count > 1 then -- 1 to exclude wire to AC
+		table.insert(data.active_acs, data.acs[1])
+	end
+	if conn2 and conn2.real_connection_count > 1 then
+		table.insert(data.active_acs, data.acs[2])
+	end
+end
+
+local function infrequent_poll(event)
+	-- update entire list and thus each entity exactly once every period
+	local period = 120
+	local list = storage.polling_displays
+	local ratio = (event.tick % period) + 1 -- +1 only works with tick freq=1, period must be divisible by this, so 1 is good
+	local last = math.ceil((ratio / period) * #list)
+	
+	for i=storage.polling_displays_cur,last do
+		poll_display(list[i])
+	end
+	
+	if ratio == period then -- end of list reached
+		storage.polling_displays_cur = 1
+	else
+		storage.polling_displays_cur = last+1
+	end
+end
+
 -- TODO: fix this version for multiple players: need to determine active surfaces then only iterate list for surface once
-local function optimized_update()
+local function optimized_update(event)
+	infrequent_poll(event)
+	
+	local _updated_prev = storage._updated_prev or {}
+	updated = {}
+	
 	for _, player in pairs(game.players) do
 		if not player.connected then goto continue end
 		
@@ -504,7 +542,27 @@ local function optimized_update()
 		-- update chart or alt mode displays unless player is in non-alt mode
 		if update_list then
 			for _, data in pairs(update_list) do
-				update(data.entity, data, false)
+				if data.active_acs == nil then data.active_acs = {} end
+				
+				-- Cool optimization: edge detector AC, read combined inputs (current + negated_previous tick signals) if get_signals()=nil, then no change
+				-- TODO: could try cache if R and G are actually connected and avoid one of these reads most of the time
+				-- newly_revealed: Need to track which checks were skipped by player optimization, since we might miss changes older that last tick
+				--local acA = data.active_acs[1]
+				--local acB = data.active_acs[2]
+				--if _updated_prev[data] == nil or
+				--   (acA and acA.get_signals(CR, CG) ~= nil) or
+				--   (acB and acB.get_signals(CR, CG) ~= nil) then
+				--	update(data.entity, data)
+				--end
+				local acA = data.acs[1]
+				local acB = data.acs[2]
+				if _updated_prev[data] == nil or
+				   acA.get_signals(CR, CG) ~= nil or
+				   acB.get_signals(CR, CG) ~= nil then
+					update(data.entity, data)
+				end
+				
+				updated[data] = true
 			end
 		end
 		
@@ -512,13 +570,15 @@ local function optimized_update()
 		local sel = player.selected
 		local data = sel and sel.valid and storage.tracked_displays[sel.unit_number] or nil
 		if data and not (update_list and update_list[data]) then
-			update(sel, data, false)
+			update(sel, data)
+			
+			updated[data] = true
 		end
 		
 		::continue::
 	end
 	
-	seen_last_tick = updated
+	storage._updated_prev = updated
 end
 
 script.on_nth_tick(12, function(event)
@@ -550,7 +610,7 @@ end
 local function on_gui_open(event)
 	local entity = event.entity --[[@as LuaEntity]]
 	if entity and entity.valid and entity.type == "display-panel" then
-		stop_tracking(entity)
+		stop_tracking(entity.unit_number --[[@as unit_number]], entity)
 	end
 end
 local function on_gui_close(event)
@@ -607,6 +667,8 @@ end)
 
 local function init(clean)
 	storage.tracked_displays = {}
+	storage.polling_displays = {}
+	storage.polling_displays_cur = 1
 	storage.surfaces = {}
 	
 	if not clean then
@@ -618,8 +680,8 @@ local function init(clean)
 	end
 end
 local function _reset()
-	for _,data in pairs(storage.tracked_displays) do
-		stop_tracking(data.entity)
+	for id,data in pairs(storage.tracked_displays) do
+		stop_tracking(id, data.entity)
 	end
 	
 	for _, s in pairs(game.surfaces) do
