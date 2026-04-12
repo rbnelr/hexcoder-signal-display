@@ -7,5 +7,5 @@
 	"dependencies": [
 		"base >= 2.0.61"
 	],
-	"description": "Easy to use multi or single signal display, useful for messing with circuits\nOkay-ish performance\nUse formats like /1000f2 for fixed point\nEach signal shows all signals"
+	"description": "Easy to use signal display that updates every tick, useful for debugging or monitoring circuits\nEach signal shows _all_ signals at once as list\nGood performance with reasonable display counts\nSupports fixed point display via /1000f2 in text box"
 }
