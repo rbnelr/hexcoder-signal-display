@@ -1,13 +1,11 @@
 {
 	"name": "hexcoder-signal-display",
-	"version": "0.1.0",
+	"version": "1.0.1",
 	"title": "Easy Signal Display",
 	"author": "Hexcoder",
 	"factorio_version": "2.0",
 	"dependencies": [
-		"base >= 2.0.61",
-		"perel >= 1.1.3",
-		"bplib >= 1.1.6"
+		"base >= 2.0.61"
 	],
 	"description": "Easy to use signal display that updates every tick, useful for debugging or monitoring circuits\nEach signal shows _all_ signals at once as list\nGood performance with reasonable display counts\nSupports fixed point display via /1000f2 in text box"
 }

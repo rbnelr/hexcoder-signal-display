@@ -1,0 +1,12 @@
+---------------------------------------------------------------------------------------------------
+Version: 1.0.1
+Date: 13. 04. 2026
+  Info:
+    - Fixed version
+  Bugfixes:
+    - Reworked code and added polling as fallback to ensure correct updating in all situations
+---------------------------------------------------------------------------------------------------
+Version: 0.1.0
+Date: 12. 04. 2026
+  Major Features:
+    - Initial release.
