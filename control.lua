@@ -1,35 +1,51 @@
+
 ---@type ModStorage
 storage = storage
 
+---@class player_index : integer
+---@class surface_index : integer
+---@class unit_number : integer
+---@class bucket_key : integer
+---@class tick_num : integer
+
 ---@class DisplayEntity : LuaEntity
----@class DisplaySet : table<integer, Display>
 
 ---@class ModStorage
----@field all_displays DisplaySet
----@field surfaces table<integer, SurfUpdateLists>
----@field extra_update DisplaySet
----@field updated_last_tick table<DisplaySet, true>
+---@field all_displays table<unit_number, Display>
 ---@field poll_list Display[]
+---@field poll_idx table<Display, integer>
 ---@field poll_cur integer
+---@field buckets table<surface_index, table<bucket_key, Bucket>>
+---@field draw_lists Bucket[]
+---@field players table<player_index, Player>
+---@field need_rebuild boolean
 
 ---@class Display
 ---@field entity DisplayEntity
 ---@field ctrl LuaDisplayPanelControlBehavior?
----@field acs? table<defines.wire_connector_id.circuit_red|defines.wire_connector_id.circuit_green, LuaEntity>
+---@field acs? table<defines.wire_connector_id.circuit_red|defines.wire_connector_id.circuit_green, LuaEntity?>
 ---@field ac1 LuaEntity?
 ---@field ac2 LuaEntity?
 ---@field sid integer
----@field poll_idx integer
+---@field chunk_key bucket_key
 
----@class SurfUpdateLists
----@field chart DisplaySet
----@field alt DisplaySet
+---@class Bucket
+---@field [1] tick_num? -- last_updated
+---@field [2] Display[] -- draw list
+---@field [3] table<Display, bucket_key> -- draw list index map
+
+---@class Player
+---@field [any] any -- TODO:
+
+local floor = math.floor
+local ceil = math.ceil
 
 local W = defines.wire_connector_id
-local CR = W.circuit_red
-local CG = W.circuit_green
-local HIDDEN = defines.wire_origin.script
---local HIDDEN = defines.wire_origin.player
+local CR = defines.wire_connector_id.circuit_red
+local CG = defines.wire_connector_id.circuit_green
+local WO_SCRIPT = defines.wire_origin.script
+local GT_ENTITY = defines.gui_type.entity
+local RM_CHART = defines.render_mode.chart
 
 -- example tich text:
 -- [virtual-signal=signal-deny] [entity=big-biter]  [virtual-signal=signal-B]
@@ -56,19 +72,157 @@ local AC_NEGATE_EACH_G = { ---@type ArithmeticCombinatorParameters
 	output_signal={type="virtual", name="signal-each"}
 }
 
-local function _dbg_update(display, no_change)
-	local pos = display.position
-	
-	local color = no_change and {.2,.2,1} or {.2,1,.2}
-	
-	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y-0.45 }, to={ x=pos.x+0.45, y=pos.y+0.45 }, color=color, width=2, surface=display.surface, time_to_live=1 }
-	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y+0.45 }, to={ x=pos.x+0.45, y=pos.y-0.45 }, color=color, width=2, surface=display.surface, time_to_live=1 }
-	
-	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y-0.45 }, to={ x=pos.x+0.45, y=pos.y+0.45 }, color=color, width=2, surface=display.surface, time_to_live=1, render_mode="chart" }
-	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y+0.45 }, to={ x=pos.x+0.45, y=pos.y-0.45 }, color=color, width=2, surface=display.surface, time_to_live=1, render_mode="chart" }
+
+local CHART_KEY = 1 / 0  -- inf, can never collide with any real chunk key
+
+-- MapPosition x/y  32bit with 8bits fractional => 24 bits units range (presumably signed)
+-- => chunk_pos range is 2^23 / 32 => chunk pos should be [-262144, 262144)
+-- chunks at y=0 are keys=[-CHUNK_HALF_RANGE, CHUNK_HALF_RANGE)
+--           y=1 are keys=[CHUNK_HALF_RANGE, CHUNK_HALF_RANGE*3) and so on
+local CHUNK_HALF_RANGE = 262144 -- 2^23 / 32
+local CHUNK_RANGE = 524288 -- 2^24 / 32
+
+---@param x integer
+---@param y integer
+---@returns bucket_key
+local function chunk_key(x, y)
+	-- x and y fit in double mantissa safely without collision
+	return y * CHUNK_RANGE + x
 end
 
--- TODO: should_update returns false if display not connected to circuit, but now it does not start updating on wire connect
+---@param key bucket_key
+---@returns integer, integer
+local function chunk_key2pos(key)
+	local x = key % CHUNK_RANGE
+	local y = floor(key / CHUNK_RANGE)
+	if x < CHUNK_HALF_RANGE then
+		return x, y
+	end
+	return x - CHUNK_RANGE, y + 1
+end
+
+---@param entity LuaEntity
+---@returns bucket_key
+local function entity_chunk_pos(entity)
+	local pos = entity.position
+	return chunk_key(floor(pos.x / 32), floor(pos.y / 32))
+end
+
+local function _dbg_disp(display, col)
+	local pos = display.position
+	
+	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y-0.45 }, to={ x=pos.x+0.45, y=pos.y+0.45 }, color=col, width=2, surface=display.surface, time_to_live=1 }
+	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y+0.45 }, to={ x=pos.x+0.45, y=pos.y-0.45 }, color=col, width=2, surface=display.surface, time_to_live=1 }
+	
+	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y-0.45 }, to={ x=pos.x+0.45, y=pos.y+0.45 }, color=col, width=6, surface=display.surface, time_to_live=1, render_mode="chart" }
+	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y+0.45 }, to={ x=pos.x+0.45, y=pos.y-0.45 }, color=col, width=6, surface=display.surface, time_to_live=1, render_mode="chart" }
+end
+local function _dbg_chunk(key, col)
+	if key == CHART_KEY then return end
+	
+	local x,y = chunk_key2pos(key)
+	local surf = game.get_player(1).surface
+	
+	local x0 = x*32 + 0.4
+	local y0 = y*32 + 0.4
+	local x1 = x*32 + 31.6
+	local y1 = y*32 + 31.6
+	
+	rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x1, y=y0 }, color=col, width=2, surface=surf, time_to_live=1 }
+	rendering.draw_line{ from={ x=x1, y=y0 }, to={ x=x1, y=y1 }, color=col, width=2, surface=surf, time_to_live=1 }
+	rendering.draw_line{ from={ x=x1, y=y1 }, to={ x=x0, y=y1 }, color=col, width=2, surface=surf, time_to_live=1 }
+	rendering.draw_line{ from={ x=x0, y=y1 }, to={ x=x0, y=y0 }, color=col, width=2, surface=surf, time_to_live=1 }
+	
+	rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x1, y=y0 }, color=col, width=10, surface=surf, time_to_live=1, render_mode="chart" }
+	rendering.draw_line{ from={ x=x1, y=y0 }, to={ x=x1, y=y1 }, color=col, width=10, surface=surf, time_to_live=1, render_mode="chart" }
+	rendering.draw_line{ from={ x=x1, y=y1 }, to={ x=x0, y=y1 }, color=col, width=10, surface=surf, time_to_live=1, render_mode="chart" }
+	rendering.draw_line{ from={ x=x0, y=y1 }, to={ x=x0, y=y0 }, color=col, width=10, surface=surf, time_to_live=1, render_mode="chart" }
+end
+
+---@param data Display
+---@param list Display[]
+---@param idxs table<Display, bucket_key>
+local function add_to_array(data, list, idxs)
+	assert(idxs[data] == nil)
+	local idx = #list + 1
+	list[idx] = data
+	idxs[data] = idx
+end
+---@param data Display
+---@param list Display[]
+---@param idxs table<Display, bucket_key>
+local function remove_from_array(data, list, idxs)
+	-- delete by swap with last
+	local idx = idxs[data]
+	local last_idx = #list
+	
+	local last = list[last_idx]
+	list[idx] = last
+	idxs[last] = idx
+	
+	list[last_idx] = nil
+	idxs[data] = nil
+end
+
+---@param disp Display
+local function add_to_poll_list(disp)
+	add_to_array(disp, storage.poll_list, storage.poll_idx)
+end
+---@param disp Display
+local function remove_from_poll_list(disp)
+	remove_from_array(disp, storage.poll_list, storage.poll_idx)
+end
+
+---@param surf table<integer, Bucket>
+---@param key bucket_key
+---@param disp Display
+---@param insert boolean
+---@returns boolean -- was_added
+local function add_or_remove_in_bucket(surf, key, disp, insert)
+	local bucket = surf[key]
+	if insert then
+		if not bucket then
+			bucket = { [2]={}, [3]={} }
+			surf[key] = bucket
+			storage.need_rebuild = true
+		end
+		
+		local idxs = bucket[3]
+		if not idxs[disp] then
+			add_to_array(disp, bucket[2], idxs)
+			return true
+		end
+	elseif bucket then
+		local idxs = bucket[3]
+		if idxs[disp] then
+			remove_from_array(disp, bucket[2], idxs)
+			
+			if #idxs == 0 then
+				surf[key] = nil
+				storage.need_rebuild = true
+			end
+		end
+	end
+	return false
+end
+
+---@param surf table<integer, Bucket>
+---@param key bucket_key
+---@param disp Display
+local function try_remove_from_bucket(surf, key, disp)
+	local bucket = surf[key]
+	if bucket then
+		local idxs = bucket[3]
+		if idxs[disp] then
+			remove_from_array(disp, bucket[2], idxs)
+			
+			if #idxs == 0 then
+				surf[key] = nil
+				storage.need_rebuild = true
+			end
+		end
+	end
+end
 
 ---@param e LuaEntity?
 ---@returns boolean
@@ -76,31 +230,16 @@ local function is_display_planel(e)
 	return e and e.valid and e.type == "display-panel"
 end
 
-local function add_to_poll_list(data)
-	assert(data.poll_idx == nil)
-	data.poll_idx = #storage.poll_list+1
-	storage.poll_list[data.poll_idx] = data
-end
-local function remove_from_poll_list(data)
-	-- delete by swap with last
-	local idx = data.poll_idx
-	data.poll_idx = nil
-	local last = #storage.poll_list
-	storage.poll_list[idx] = storage.poll_list[last]
-	storage.poll_list[idx].poll_idx = idx
-	storage.poll_list[last] = nil
-end
-
 ---@param c LuaWireConnector
 ---@returns boolean
 -- any circuit connection not going to hidden change detector
 local function is_actually_connected(c)
-	if c.real_connection_count >= 2 or
-	   c.real_connection_count >= 1 and c.real_connections[1].origin == defines.wire_origin.player then
-		return true
-	end
-	return false
+	return c and
+	  (c.real_connection_count >= 2 or
+	   c.real_connection_count >= 1 and c.real_connections[1].origin ~= WO_SCRIPT)
 end
+
+local update_messages
 
 ---@param display DisplayEntity
 ---@param ctrl LuaDisplayPanelControlBehavior?
@@ -108,7 +247,7 @@ end
 local function is_active_display(display, ctrl)
 	-- may be needed in multiplayer? sounds overkill
 	for _, player in pairs(game.players) do
-		if player.opened_gui_type == defines.gui_type.entity and display == player.opened then
+		if player.opened_gui_type == GT_ENTITY and display == player.opened then
 			return false
 		end
 	end
@@ -143,9 +282,8 @@ local function reset_messages(data)
 end
 
 -- stop updating, clean messages so user can properly edit
----@param id integer
 ---@param data Display
-local function reset_display(id, data)
+local function reset_display(data)
 	-- reset messages even if not data yet, relevant for copy-pasted entities
 	reset_messages(data)
 	
@@ -156,13 +294,11 @@ local function reset_display(id, data)
 	data.ac1 = nil
 	data.ac2 = nil
 	
-	local surf = storage.surfaces[data.sid]
+	local surf = storage.buckets[data.sid]
 	if surf then
-		surf.chart[id] = nil
-		surf.alt[id] = nil
+		try_remove_from_bucket(surf, CHART_KEY, data)
+		try_remove_from_bucket(surf, data.chunk_key, data)
 	end
-	
-	storage.extra_update[id] = nil
 end
 
 -- start or stop updating display depending on if any messages contain format trigger {}
@@ -175,8 +311,9 @@ local function check_display(display)
 		
 		data = {
 			entity = display,
+			acs = {},
 			sid = display.surface_index,
-			acs = {}
+			chunk_key = entity_chunk_pos(display)
 		}
 		add_to_poll_list(data)
 		storage.all_displays[id] = data
@@ -184,14 +321,16 @@ local function check_display(display)
 	
 	data.ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
 	
-	local acs = data.acs
 	local active = is_active_display(display, data.ctrl)
+	local need_update = false
 	
 	if active then
-		local conns = display.get_wire_connectors(false)
+		local d_conns = display.get_wire_connectors(false)
+		local acs = data.acs ---@cast acs -nil
 		
 		local function update_combinator(wire)
-			local connected = is_actually_connected(conns[wire])
+			local d_conn = d_conns and d_conns[wire]
+			local connected = is_actually_connected(d_conn)
 			local ac = acs[wire]
 			if (ac ~= nil) == connected then
 				return false -- nothing to do
@@ -205,58 +344,60 @@ local function check_display(display)
 			
 			ac = display.surface.create_entity{
 				name="hexcoder-signal-display-hidden-change-detector", force=display.force,
-				position={display.position.x + (wire == W.circuit_red and -0.4 or 0.4), display.position.y-1.5}, snap_to_grid=false,
+				position={display.position.x + (wire == CR and -0.4 or 0.4), display.position.y-1.5}, snap_to_grid=false,
 				direction=defines.direction.north
 			} ---@cast ac -nil
 			ac.destructible = false
 			
 			local ctrl = ac.get_or_create_control_behavior() --[[@as LuaArithmeticCombinatorControlBehavior]]
 			
-			local conn = ac.get_wire_connectors(true)
-			local d = display.get_wire_connectors(true)
+			local ac_conn = ac.get_wire_connectors(true)
 			
-			if wire == W.circuit_red then
+			if wire == CR then
 				ctrl.parameters = AC_NEGATE_EACH_R
-				conn[W.combinator_input_red  ].connect_to(d[wire], false, HIDDEN)
-				conn[W.combinator_input_green].connect_to(conn[W.combinator_output_green], false, HIDDEN)
+				ac_conn[W.combinator_input_red  ].connect_to(d_conn, false, WO_SCRIPT)
+				ac_conn[W.combinator_input_green].connect_to(ac_conn[W.combinator_output_green], false, WO_SCRIPT)
 			else
 				ctrl.parameters = AC_NEGATE_EACH_G
-				conn[W.combinator_input_red  ].connect_to(conn[W.combinator_output_red], false, HIDDEN)
-				conn[W.combinator_input_green].connect_to(d[wire], false, HIDDEN)
+				ac_conn[W.combinator_input_red  ].connect_to(ac_conn[W.combinator_output_red], false, WO_SCRIPT)
+				ac_conn[W.combinator_input_green].connect_to(d_conn, false, WO_SCRIPT)
 			end
 			
 			acs[wire] = ac
 			return true
 		end
 		
-		local changed = update_combinator(CR)
-		      changed = update_combinator(CG) or changed
-		if changed then
-			local it = nil
-			it, data.ac1 = next(acs, it)
-			it, data.ac2 = next(acs, it)
+		need_update = update_combinator(CR) or need_update
+		need_update = update_combinator(CG) or need_update
+		if need_update then
+			if acs[CR] then
+				data.ac1 = acs[CR]
+				data.ac2 = acs[CG]
+			else
+				data.ac1 = acs[CG]
+			end
 		end
 	end
 	if active and data.ac1 then
-		-- add to update lists
-		local surf = storage.surfaces[display.surface_index]
+		-- add to update appropriate update lists
+		local surf = storage.buckets[data.sid]
 		if not surf then
 			script.register_on_object_destroyed(display.surface)
-			surf = { chart={}, alt={} }
-			storage.surfaces[display.surface_index] = surf
+			surf = {}
+			storage.buckets[data.sid] = surf
+			storage.need_rebuild = true
 		end
 		
-		if (surf.chart[id] ~= nil) ~= display.display_panel_show_in_chart then
-			surf.chart[id] = display.display_panel_show_in_chart and data or nil
-			-- updated_last_tick optimization might not be valid for this display
-			storage.extra_update[id] = data
-		end
-		if (surf.alt[id] ~= nil) ~= display.display_panel_always_show then
-			surf.alt[id] = display.display_panel_always_show and data or nil
-			storage.extra_update[id] = data
+		changed = add_or_remove_in_bucket(surf, CHART_KEY, data, display.display_panel_show_in_chart) or changed
+		changed = add_or_remove_in_bucket(surf, data.chunk_key, data, display.display_panel_always_show) or changed
+		
+		if changed then
+			-- ensure update, as change detection might not trigger after creation
+			-- let future ticks be handled by change detection
+			update_messages(data)
 		end
 	else
-		reset_display(id, data)
+		reset_display(data)
 	end
 end
 
@@ -264,7 +405,7 @@ local deathrattles = {}
 deathrattles[defines.target_type.entity] = function(event)
 	local data = storage.all_displays[event.useful_id]
 	if data then
-		reset_display(event.useful_id, data)
+		reset_display(data)
 		remove_from_poll_list(data)
 		storage.all_displays[event.useful_id] = nil
 	end
@@ -283,7 +424,7 @@ end
 -- -> LuaEntity.get_signals supposedly is "current", ie the same as the the in-game gui should show
 
 ---@param data Display
-local function update_messages(data)
+update_messages = function(data)
 	local display = data.entity
 	-- display.display_panel_text and display.display_panel_icon
 	-- are essentially variables that the player can config if the display is not connect to circuits
@@ -324,7 +465,7 @@ local function update_messages(data)
 	---@param input string
 	---@returns string
 	local function get_all_signals_sum_text(input)
-		all_signals = all_signals or display.get_signals(defines.wire_connector_id.circuit_red, defines.wire_connector_id.circuit_green)
+		all_signals = all_signals or display.get_signals(CR, CG)
 		
 		-- Is the the only way to do this?
 		local count = 0
@@ -339,7 +480,7 @@ local function update_messages(data)
 	---@param input string
 	---@returns string
 	local function get_all_signals_text(input)
-		all_signals = all_signals or display.get_signals(defines.wire_connector_id.circuit_red, defines.wire_connector_id.circuit_green)
+		all_signals = all_signals or display.get_signals(CR, CG)
 		if not all_signals or next(all_signals) == nil then
 			return input:gsub("{[^{}]*}", "{}", 1)
 		end
@@ -379,7 +520,7 @@ local function update_messages(data)
 	---@param icon SignalID
 	---@returns string
 	local function get_signal_text(input, icon)
-		local count = display.get_signal(icon, defines.wire_connector_id.circuit_red, defines.wire_connector_id.circuit_green) or 0
+		local count = display.get_signal(icon, CR, CG) or 0
 		
 		return format_count_text(input, count)
 	end
@@ -426,7 +567,8 @@ local function polling(event)
 	
 	for i=storage.poll_cur,last do
 		check_display(list[i].entity)
-		--_dbg_update(list[i].entity, true)
+		
+		--_dbg_disp(list[i].entity, {.2,.2,1})
 	end
 	
 	if ratio == period then -- end of list reached
@@ -435,90 +577,248 @@ local function polling(event)
 		storage.poll_cur = last+1
 	end
 end
-local function optimized_update()
-	-- optimize if no displays are placed
-	--if next(storage.all_displays) == nil then
-	--	storage.updated_last_tick = {}
-	--	storage.extra_update = {}
-	--	return
-	--end
+
+local function _dbg_AABB(x0,x1,y0,y1, surface, color)
+	rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x0, y= y1 }, color=color, width=4, surface=surface, time_to_live=1 }
+	rendering.draw_line{ from={ x=x1, y=y0 }, to={ x=x1, y= y1 }, color=color, width=4, surface=surface, time_to_live=1 }
+	rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x1, y= y0 }, color=color, width=4, surface=surface, time_to_live=1 }
+	rendering.draw_line{ from={ x=x0, y=y1 }, to={ x=x1, y= y1 }, color=color, width=4, surface=surface, time_to_live=1 }
+end
+
+local view_margin = 3
+-- unlike many games, zoom is not tied to vertical or horizontal fov/orthographic diameter
+-- instead at zoom=1: 1 tile is drawn at 32 pixels at my specific window resolution, 2 is zoomed in to 1tile=64px
+-- I hope this is actually correct for a all setups
+local zoom_scale = 0.5/32 -- could listen to on_player_display_resolution_changed
+
+local function rebuild_drawlists()
+	local set = {}
+	local draw_lists = {}
 	
-	-- collect lists of per-surface chart and alt lists that are observed
-	-- plus lists of any displays that are not in chart or alt but are hovered
-	-- use 'update_lists[obj] = true' to deduplicate
-	local update_lists = {}
-	local extra_update = storage.extra_update
-	--for _, player in pairs(game.players) do
-	--	if not player.connected then goto continue end
+	local players = storage.players
 	for _, player in pairs(game.connected_players) do
+		local pl = players[player.index]
+		if not pl then
+			pl = {}
+			players[player.index] = pl
+		end
+		
+		local mode = player.render_mode
+		local chart = mode == RM_CHART
+		local alt = player.game_view_settings.show_entity_info
+		pl.mode = mode
+		
+		--local sel = player.selected -- hovered
+		--local open = player.opened
+		--game.print("".. serpent.block(player.render_mode))
+		
+		local pos = player.position
+		-- player chunk index
+		local posX = floor(pos.x / 32)
+		local posY = floor(pos.y / 32)
+		
+		local zoom = player.zoom
+		local res = player.display_resolution
+		--local scale = player.display_scale
+		--local density = player.display_density_scale
+		
+		local f = zoom_scale / zoom
+		-- player view
+		local half_sizeX = ceil((res.width * f + view_margin) / 32)
+		local half_sizeY = ceil((res.height * f + view_margin) / 32)
+		
+		--player.zoom_limits = {
+		--	closest = { zoom = 4 },
+		--	furthest = { distance = 800, max_distance = 1000 },
+		--	furthest_game_view = { distance = 800, max_distance = 1000 }
+		--}
+		
+		pl.zoom = zoom
+		pl.posX = posX
+		pl.posY = posY
+		pl.half_sizeX = half_sizeX
+		pl.half_sizeY = half_sizeY
+		pl.resX = res.width
+		pl.resY = res.height
+		
+		-- visible chunk indexes, inclusive
+		local x0 = posX - half_sizeX
+		local x1 = posX + half_sizeX
+		local y0 = posY - half_sizeY
+		local y1 = posY + half_sizeY
+		
 		-- TODO: optimize via on_player_toggled_alt_mode + ?
 		-- sadly chart mode does not seem to have en event? poll that one infrequently?
-		local surf = storage.surfaces[player.surface_index]
+		local surf = storage.buckets[player.surface_index]
 		if surf then
-			if player.render_mode == defines.render_mode.chart then -- game view or char_zoomed_in render actual entities, chart is map mode
-				update_lists[surf.chart] = true
-			elseif player.game_view_settings.show_entity_info then
-				update_lists[surf.alt] = true
-			end
-		end
-		
-		-- TODO: This should be optimized via on_selected_entity_changed and on_gui_opened/closed
-		local open_id = player.opened_gui_type == defines.gui_type.entity and player.opened.unit_number or nil
-		
-		local sel_id = player.selected and player.selected.unit_number
-		local data = sel_id and sel_id ~= open_id and storage.all_displays[sel_id] or nil
-		if data then ---@cast sel_id -nil
-			extra_update[sel_id] = data
-		end
-		
-		-- weird logic, and doens't even work if player 1 has ui open, and player 2 hovers it
-		-- TODO: optimize by just not removing from update list on open, remove this check here, and then just skip if update_messages actually happens?
-		if open_id then
-			extra_update[open_id] = nil
-		end
-		
-		--::continue::
-	end
-	
-	-- if update list was not updates last tick, bypass change detection
-	local updated_last_tick = storage.updated_last_tick
-	
-	for update_list, _ in pairs(update_lists) do
-		if updated_last_tick[update_list] == nil then
-			-- change detect ACs not valid since did not update this list read last tick
-			-- (Alt mode toggle, enter/exit chart mode, surface switch, new player etc.)
-			for id, data in pairs(update_list) do
-				update_messages(data)
-				extra_update[id] = nil
-			end
-		else
-			for id, data in pairs(update_list) do
-				-- Cool optimization: edge detector AC, read combined inputs (current + negated_previous tick signals) if get_signals()=nil, then no change
-				-- Need 2 to catch red and green wires (could usually avoid get_signals if wire connect/disconnect was an event, but unclear how slow 1 API call actually is vs the extra check in lua
-				-- This change detection only works if we also updated this display last tick!
+			
+			pl.alt = false
+			if chart then -- game view or char_zoomed_in render actual entities, chart is map mode
+				local bucket = surf[CHART_KEY]
+				if bucket and not set[bucket] then
+					set[bucket] = bucket
+					table.insert(draw_lists, bucket)
+				end
+			elseif alt then
+				pl.alt = true
 				
-				-- TODO: can this still be micro-optimized?
-				-- Check change detector for single or both wires
-				local b = data.ac2
-				if data.ac1.get_signals(CR, CG) or (b and b.get_signals(CR, CG)) then
-					update_messages(data)
-					extra_update[id] = nil
-				--else
-				--	_dbg_update(data.entity, true)
+				for y=y0,y1 do
+					local keyY = CHUNK_RANGE*y
+					for x=x0,x1 do
+						local key = keyY+x
+						local bucket = surf[key]
+						if bucket and not set[bucket] then
+							set[bucket] = bucket
+							table.insert(draw_lists, bucket)
+						end
+					end
 				end
 			end
 		end
 	end
+		---- TODO: This should be optimized via on_selected_entity_changed and on_gui_opened/closed
+		--local open_id = player.opened_gui_type == GT_ENTITY and player.opened.unit_number or nil
+		--
+		--local sel_id = player.selected and player.selected.unit_number
+		--local data = sel_id and sel_id ~= open_id and storage.all_displays[sel_id] or nil
+		--if data then ---@cast sel_id -nil
+		--	extra_update[sel_id] = data
+		--end
+		--
+		---- weird logic, and doens't even work if player 1 has ui open, and player 2 hovers it
+		---- TODO: optimize by just not removing from update list on open, remove this check here, and then just skip if update_messages actually happens?
+		--if open_id then
+		--	extra_update[open_id] = nil
+		--end
+	storage.draw_lists = draw_lists
 	
-	-- handle hovered displays and displays that were modified/added potentially breaking change detect
-	-- (don't add observed checks as this is rare)
-	for _, data in pairs(extra_update) do
-		update_messages(data)
+	game.print("rebuild_drawlists: ".. serpent.line(game.tick))
+end
+
+---@returns boolean
+local function check_player()
+	local players = storage.players
+	for _, player in pairs(game.connected_players) do
+		local pl = players[player.index]
+		
+		local mode = player.render_mode
+		if not pl or mode ~= pl.mode then
+			return true
+		end
+		
+		if pl.alt then
+			local zoom = player.zoom
+			if zoom ~= pl.zoom then
+				local f = zoom_scale / zoom
+				local half_sizeX = ceil((pl.resX * f + view_margin) / 32)
+				local half_sizeY = ceil((pl.resY * f + view_margin) / 32)
+				if half_sizeX ~= pl.half_sizeX or half_sizeY ~= pl.half_sizeY then
+					return true
+				end
+				pl.zoom = zoom
+			end
+		end
+	end
+	return false
+end
+
+script.on_event(defines.events.on_player_changed_position, function(event)
+	-- player moved by one tile
+	local id = event.player_index
+	local pl = storage.players[id]
+	if pl and pl.alt then
+		local player = game.get_player(id) ---@cast player -nil
+		local pos = player.position
+		--local surf = player.surface
+		--local ppos = player.physical_position
+		--local psurf = player.physical_surface
+		--game.print("on_player_changed_position: ".. serpent.line({ pos, surf, ppos, psurf, event }), {skip=defines.print_skip.never})
+		
+		-- if moved into another chunk while in map_view and 
+		-- player chunk index
+		local posX = floor(pos.x / 32)
+		local posY = floor(pos.y / 32)
+		if posX ~= pl.posX or posY ~= pl.posY then
+			storage.need_rebuild = true
+		end
+	end
+end)
+
+local function optimized_update()
+	local need_rebuild = storage.need_rebuild
+	if need_rebuild or check_player() --[[or (game.tick%300==0)]] then
+		storage.need_rebuild = false
+		rebuild_drawlists()
 	end
 	
-	storage.updated_last_tick = update_lists
-	storage.extra_update = {}
+	for _, player in pairs(game.connected_players) do
+		local pl = storage.players[player.index]
+		local x0 = pl.posX - pl.half_sizeX
+		local x1 = pl.posX + pl.half_sizeX
+		local y0 = pl.posY - pl.half_sizeY
+		local y1 = pl.posY + pl.half_sizeY
+		_dbg_AABB(x0*32, x1*32+32, y0*32,y1*32+32, player.surface, {1,1,.2})
+		
+		x0 = x0+1
+		x1 = x1-1
+		y0 = y0+1
+		y1 = y1-1
+		_dbg_AABB(x0*32, x1*32+32, y0*32,y1*32+32, player.surface, {0,1,.2})
+	end
+	
+	local draw_lists = storage.draw_lists
+	
+	local tick = game.tick
+	local last_tick = tick-1
+	
+	for b=1,#draw_lists do
+		local bucket = draw_lists[b]
+		local last_updated = bucket[1]
+		local list = bucket[2]
+		
+		bucket[1] = tick
+		
+		_dbg_chunk(entity_chunk_pos(list[1].entity), {1,.2,.2})
+		
+		if last_updated ~= last_tick then
+			-- slowpath, chunk was not observed last tick
+			-- Due to new chunk, alt mode toggle, enter/exit chart mode, surface switch, new player, player moved or zoomed etc.
+			-- change detect ACs not valid since did not update this list last tick
+			for i=1,#list do
+				local data = list[i]
+				update_messages(data)
+				
+				_dbg_disp(data.entity, {.2,1,.2})
+			end
+		else
+			-- fastpath, do circuit change detection
+			for i=1,#list do
+				local data = list[i]
+				-- Cool optimization: edge detector AC, read combined inputs (current + negated_previous tick signals) if get_signals()=nil, then no change
+				-- Need 2 to catch red and green wires (could usually avoid get_signals if wire connect/disconnect was an event, but unclear how slow 1 API call actually is vs the extra check in lua
+				-- This change detection only works if we also updated this display last tick!
+				local b = data.ac2
+				if data.ac1.get_signals(CR, CG) or (b and b.get_signals(CR, CG)) then
+					update_messages(data)
+					
+					--_dbg_disp(data.entity, {.2,1,.2})
+				end
+				_dbg_disp(data.entity, {.2,1,.2})
+			end
+		end
+	end
 end
+
+script.on_event({
+	defines.events.on_player_joined_game,
+	defines.events.on_player_left_game,
+	defines.events.on_player_respawned,
+	defines.events.on_player_changed_surface,
+	defines.events.on_player_controller_changed,
+	defines.events.on_player_display_resolution_changed,
+	--defines.events.on_player_display_scale_changed,
+	defines.events.on_player_toggled_alt_mode,
+}, rebuild_drawlists)
 
 -- Tick for convenience feature
 ---@param display LuaEntity
@@ -545,7 +845,7 @@ local function tick_gui(display)
 end
 script.on_nth_tick(12, function(event)
 	for _,player in pairs(game.players) do
-		local entity = player.opened_gui_type == defines.gui_type.entity and player.opened or nil --[[@as LuaEntity?]]
+		local entity = player.opened_gui_type == GT_ENTITY and player.opened or nil --[[@as LuaEntity?]]
 		if entity and entity.valid and entity.type == "display-panel" then
 			tick_gui(entity)
 		end
@@ -553,6 +853,8 @@ script.on_nth_tick(12, function(event)
 end)
 
 script.on_event(defines.events.on_tick, function(event)
+	--if true then return end
+	
 	polling(event)
 	optimized_update()
 end)
@@ -569,11 +871,11 @@ script.on_event(defines.events.on_gui_opened, function(event)
 	if is_display_planel(entity) then ---@cast entity DisplayEntity
 		local data = storage.all_displays[entity.unit_number]
 		if data then
-			reset_display(entity.unit_number, data)
+			reset_display(data) -- TODO: don't remove from buckets for efficiency, simply skip update in update_messages?
 		end
 	end
 end)
-script.on_event(defines.events.on_gui_closed, on_entity_event)
+script.on_event(defines.events.on_gui_closed, on_entity_event) -- TODO: only check display after checking that all players have closed it?
 
 -- React to the all entity create events
 for _, event in pairs({
@@ -594,7 +896,12 @@ script.on_event(defines.events.on_entity_settings_pasted, on_entity_event) -- so
 -- I tried blueprint lib + perel + custom undo/redo handlers, and it still did not work correctly
 
 deathrattles[defines.target_type.surface] = function(event)
-	storage.surfaces[event.useful_id] = nil
+	storage.buckets[event.useful_id] = nil
+	rebuild_drawlists()
+end
+deathrattles[defines.target_type.player] = function(event)
+	storage.players[event.useful_id] = nil
+	rebuild_drawlists()
 end
 script.on_event(defines.events.on_object_destroyed, function(event)
 	local handler = deathrattles[event.type]
@@ -604,11 +911,13 @@ end)
 local function init()
 	storage = {}
 	storage.all_displays = {}
-	storage.surfaces = {}
-	storage.extra_update = {}
-	storage.updated_last_tick = {}
 	storage.poll_list = {}
+	storage.poll_idx = {}
 	storage.poll_cur = 1
+	storage.buckets = {}
+	storage.draw_lists = {}
+	storage.players = {}
+	storage.need_rebuild = true
 	
 	for _, surface in pairs(game.surfaces) do
 		for _, display in ipairs(surface.find_entities_filtered{ type="display-panel" }) do ---@cast display DisplayEntity
