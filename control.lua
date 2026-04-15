@@ -203,9 +203,10 @@ local function add_or_remove_in_bucket(surf, key, disp, insert)
 	elseif bucket then
 		local idxs = bucket[3]
 		if idxs[disp] then
-			remove_from_array(disp, bucket[2], idxs)
+			local list = bucket[2]
+			remove_from_array(disp, list, idxs)
 			
-			if #idxs == 0 then
+			if #list == 0 then
 				surf[key] = nil
 				storage.need_rebuild = true
 			end
@@ -222,9 +223,10 @@ local function try_remove_from_bucket(surf, key, disp)
 	if bucket then
 		local idxs = bucket[3]
 		if idxs[disp] then
-			remove_from_array(disp, bucket[2], idxs)
+			local list = bucket[2]
+			remove_from_array(disp, list, idxs)
 			
-			if #idxs == 0 then
+			if #list == 0 then
 				surf[key] = nil
 				storage.need_rebuild = true
 			end
@@ -234,14 +236,15 @@ end
 
 ---@param e LuaEntity?
 ---@returns boolean
-local function is_display_planel(e)
+local function is_display_panel(e)
 	return e and e.valid and e.type == "display-panel"
 end
 
----@param c LuaWireConnector
+---@param c LuaWireConnector?
 ---@returns boolean
 -- any circuit connection not going to hidden change detector
 local function is_actually_connected(c)
+	if not c then return false end
 	local count = c.real_connection_count
 	return count >= 2 or count >= 1 and c.real_connections[1].origin ~= WO_SCRIPT
 end
@@ -305,12 +308,12 @@ end
 ---@param display DisplayEntity
 local function check_display(display)
 	local id = display.unit_number ---@cast id -nil
-	local data = storage.all_displays[id]
 	
 	if storage.opened_guis[id] then
 		return -- don't touch!
 	end
 	
+	local data = storage.all_displays[id]
 	if not data then
 		script.register_on_object_destroyed(display)
 		
@@ -335,9 +338,8 @@ local function check_display(display)
 		
 		local function update_combinator(wire)
 			local d_conn = d_conns and d_conns[wire]
-			local connected = d_conn and is_actually_connected(d_conn)
 			local ac = acs[wire]
-			if (ac ~= nil) == connected then
+			if (ac ~= nil) == is_actually_connected(d_conn) then
 				return false -- nothing to do
 			end
 			
@@ -393,10 +395,10 @@ local function check_display(display)
 			storage.need_rebuild = true
 		end
 		
-		changed = add_or_remove_in_bucket(surf, CHART_KEY, data, display.display_panel_show_in_chart) or changed
-		changed = add_or_remove_in_bucket(surf, data.chunk_key, data, display.display_panel_always_show) or changed
+		need_update = add_or_remove_in_bucket(surf, CHART_KEY, data, display.display_panel_show_in_chart) or need_update
+		need_update = add_or_remove_in_bucket(surf, data.chunk_key, data, display.display_panel_always_show) or need_update
 		
-		if changed then
+		if need_update then
 			-- ensure update, as change detection might not trigger after creation
 			-- let future ticks be handled by change detection
 			update_messages(data)
@@ -502,6 +504,9 @@ update_messages = function(data)
 			return input:gsub("{[^{}]*}", "{}", 1)
 		end
 		
+		local limit = 17 -- 16+1
+		all_signals[limit] = nil
+		
 		table.sort(all_signals, _comp_signal)
 		
 		-- TODO: I don't know performance characteristics of lua, but creating new strings might be slow
@@ -529,8 +534,12 @@ update_messages = function(data)
 			else
 				text = string.format(formQ, text, type,sig.name,sig.quality, s.count/div)
 			end
+			-- TODO: stop after 10 items or so, or track string length at stop at 500 at the latest
+			-- about 12 signals per line if each has count=1, and at ~20 I reach 500 char limit
 		end
 		
+		-- TODO: supposedly pushing individual formatted strings into a list, then doing  table.concat(str_list) could be faster
+		-- test this by disabling change detect and possibly using LuaProfiler?
 		return input:gsub("{[^{}]*}", text.." }", 1)
 	end
 	---@param input string
@@ -572,7 +581,9 @@ update_messages = function(data)
 					-- Seems to be working, the unsorted signals appear to be in a fixed order (order like in UI / internal ID order?)
 					-- it's inefficient but I do change detection, so...!
 					all_signals = all_signals or display.get_signals(CR, CG)
-					local any_signal_count = all_signals and all_signals[1].count or 0
+					
+					local any_signal = all_signals and all_signals[1]
+					local any_signal_count = any_signal and any_signal.count or 0
 					text = format_count_text(text, any_signal_count)
 				else
 					-- show signal count
@@ -612,7 +623,7 @@ end
 script.on_nth_tick(12, function(event)
 	for _,player in pairs(game.players) do
 		local entity = player.opened_gui_type == GT_ENTITY and player.opened or nil --[[@as LuaEntity?]]
-		if is_display_planel(entity) then ---@cast entity DisplayEntity
+		if is_display_panel(entity) then ---@cast entity DisplayEntity
 			tick_gui(entity)
 		end
 	end
@@ -775,9 +786,11 @@ local function polling(event)
 	local last = math.ceil((ratio / period) * #list)
 	
 	for i=storage.poll_cur,last do
-		check_display(list[i].entity)
-		
-		--_dbg_disp(list[i].entity, {.2,.2,1})
+		local e = list[i].entity
+		if e and e.valid then
+			check_display(list[i].entity)
+			--_dbg_disp(list[i].entity, {.2,.2,1})
+		end
 	end
 	
 	if ratio == period then -- end of list reached
@@ -893,10 +906,12 @@ script.on_event(defines.events.on_tick, function(event)
 end)
 
 script.on_event(defines.events.on_selected_entity_changed, function(event)
+	--game.print("on_selected_entity_changed: ".. serpent.line(event))
 	local id = event.player_index
 	local pl = storage.players[id]
 	if pl then
-		local e = event.last_entity
+		local player = game.get_player(id) ---@cast player -nil
+		local e = player.selected
 		pl[10] = e and storage.all_displays[e.unit_number]
 	end
 end)
@@ -904,14 +919,14 @@ end)
 local function on_entity_event(event)
 	--game.print("on_entity_event: ".. serpent.line(event))
 	local entity = event.entity or event.destination
-	if is_display_planel(entity) then ---@cast entity DisplayEntity
+	if is_display_panel(entity) then ---@cast entity DisplayEntity
 		check_display(entity)
 	end
 end
 
 script.on_event(defines.events.on_gui_opened, function(event)
 	local entity = event.entity
-	if is_display_planel(entity) then ---@cast entity DisplayEntity
+	if is_display_panel(entity) then ---@cast entity DisplayEntity
 		local pid = event.player_index
 		local data = storage.all_displays[entity.unit_number]
 		if data then
@@ -930,7 +945,7 @@ script.on_event(defines.events.on_gui_opened, function(event)
 end)
 script.on_event(defines.events.on_gui_closed, function(event)
 	local entity = event.entity
-	if is_display_planel(entity) then ---@cast entity DisplayEntity
+	if is_display_panel(entity) then ---@cast entity DisplayEntity
 		local pid = event.player_index
 		local pl = storage.players[pid] or {}
 		pl.open = nil
@@ -1009,6 +1024,7 @@ end
 script.on_configuration_changed(function(data)
 	local changes = data.mod_changes["hexcoder-signal-display"]
 	if not changes then return end
+	_reset()
 end)
 
 -- removed to not clutter up /help
