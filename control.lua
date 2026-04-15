@@ -25,13 +25,13 @@ storage = storage
 ---@field entity DisplayEntity
 ---@field ctrl LuaDisplayPanelControlBehavior?
 ---@field acs? table<defines.wire_connector_id.circuit_red|defines.wire_connector_id.circuit_green, LuaEntity?>
----@field ac1 LuaEntity?
----@field ac2 LuaEntity?
+---@field [1] LuaEntity? -- ac1 (Use array since it's supposedly faster)
+---@field [2] LuaEntity? -- ac2
 ---@field sid integer
 ---@field chunk_key bucket_key
 ---@field last_updated tick_num?
 
----@class Bucket
+---@class Bucket -- Use array since it's supposedly faster
 ---@field [1] tick_num? -- last_updated
 ---@field [2] Display[] -- draw list
 ---@field [3] table<Display, bucket_key> -- draw list index map
@@ -291,8 +291,8 @@ local function reset_display(data)
 		ac.destroy()
 	end
 	data.acs = {}
-	data.ac1 = nil
-	data.ac2 = nil
+	data[1] = nil -- ac1
+	data[2] = nil -- ac2
 	
 	local surf = storage.buckets[data.sid]
 	if surf then
@@ -376,14 +376,14 @@ local function check_display(display)
 		need_update = update_combinator(CG) or need_update
 		if need_update then
 			if acs[CR] then
-				data.ac1 = acs[CR]
-				data.ac2 = acs[CG]
+				data[1] = acs[CR]
+				data[2] = acs[CG]
 			else
-				data.ac1 = acs[CG]
+				data[1] = acs[CG]
 			end
 		end
 	end
-	if active and data.ac1 then
+	if active and data[1] then
 		-- add to update appropriate update lists
 		local surf = storage.buckets[data.sid]
 		if not surf then
@@ -640,7 +640,7 @@ local function rebuild_drawlists()
 		local mode = player.render_mode
 		local chart = mode == RM_CHART
 		local alt = player.game_view_settings.show_entity_info
-		pl.mode = mode
+		pl[1] = mode
 		
 		local pos = player.position
 		-- player chunk index
@@ -663,9 +663,9 @@ local function rebuild_drawlists()
 		--	furthest_game_view = { distance = 800, max_distance = 1000 }
 		--}
 		
-		pl.zoom = zoom
-		pl.posX = posX
-		pl.posY = posY
+		pl[3] = zoom
+		pl[4] = posX
+		pl[5] = posY
 		pl.half_sizeX = half_sizeX
 		pl.half_sizeY = half_sizeY
 		pl.resX = res.width
@@ -682,7 +682,7 @@ local function rebuild_drawlists()
 		local surf = storage.buckets[player.surface_index]
 		if surf then
 			
-			pl.alt = false
+			pl[2] = false
 			if chart then -- game view or char_zoomed_in render actual entities, chart is map mode
 				local bucket = surf[CHART_KEY]
 				if bucket and not set[bucket] then
@@ -691,7 +691,7 @@ local function rebuild_drawlists()
 					_total = _total + #bucket[2]
 				end
 			elseif alt then
-				pl.alt = true
+				pl[2] = true
 				
 				for y=y0,y1 do
 					local keyY = CHUNK_RANGE*y
@@ -731,7 +731,7 @@ script.on_event(defines.events.on_player_changed_position, function(event)
 	-- player moved by one tile
 	local id = event.player_index
 	local pl = storage.players[id]
-	if pl and pl.alt then
+	if pl and pl[2] then
 		local player = game.get_player(id) ---@cast player -nil
 		local pos = player.position
 		--local surf = player.surface
@@ -743,7 +743,7 @@ script.on_event(defines.events.on_player_changed_position, function(event)
 		-- player chunk index
 		local posX = floor(pos.x / 32)
 		local posY = floor(pos.y / 32)
-		if posX ~= pl.posX or posY ~= pl.posY then
+		if posX ~= pl[4] or posY ~= pl[5] then
 			storage.need_rebuild = true
 		end
 	end
@@ -798,23 +798,23 @@ local function optimized_update()
 		local pl = players[player.index]
 		
 		local mode = player.render_mode
-		if not pl or mode ~= pl.mode then
+		if not pl or mode ~= pl[1] then
 			-- rebuild if player switched to/from char view
 			need_rebuild = true
-		elseif pl.alt then
+		elseif pl[2] then
 			local zoom = player.zoom
-			if zoom ~= pl.zoom then
+			if zoom ~= pl[3] then
 				local f = zoom_scale / zoom
 				local half_sizeX = ceil((pl.resX * f + view_margin) / 32)
 				local half_sizeY = ceil((pl.resY * f + view_margin) / 32)
 				if half_sizeX ~= pl.half_sizeX or half_sizeY ~= pl.half_sizeY then
 					need_rebuild = true
 				end
-				pl.zoom = zoom
+				pl[3] = zoom
 			end
 			
-			if pl.sel then
-				update_messages(pl.sel)
+			if pl[10] then
+				update_messages(pl[10])
 			end
 		end
 	end
@@ -826,10 +826,10 @@ local function optimized_update()
 	
 	--for _, player in pairs(game.connected_players) do
 	--	local pl = storage.players[player.index]
-	--	local x0 = pl.posX - pl.half_sizeX
-	--	local x1 = pl.posX + pl.half_sizeX
-	--	local y0 = pl.posY - pl.half_sizeY
-	--	local y1 = pl.posY + pl.half_sizeY
+	--	local x0 = pl[4] - pl.half_sizeX
+	--	local x1 = pl[4] + pl.half_sizeX
+	--	local y0 = pl[5] - pl.half_sizeY
+	--	local y1 = pl[5] + pl.half_sizeY
 	--	_dbg_AABB(x0*32, x1*32+32, y0*32,y1*32+32, player.surface, {1,1,.2})
 	--	
 	--	x0 = x0+1
@@ -870,8 +870,8 @@ local function optimized_update()
 				-- Cool optimization: edge detector AC, read combined inputs (current + negated_previous tick signals) if get_signals()=nil, then no change
 				-- Need 2 to catch red and green wires, but second get_signals likely is rare
 				-- This change detection only works if we also updated this display last tick!
-				local b = data.ac2
-				if data.ac1.get_signals(CR, CG) or (b and b.get_signals(CR, CG)) then
+				local b = data[2]
+				if data[1].get_signals(CR, CG) or (b and b.get_signals(CR, CG)) then
 					update_messages(data)
 					
 					--_dbg_disp(data.entity, {.2,1,.2})
@@ -882,7 +882,12 @@ local function optimized_update()
 	end
 end
 
+local _reset2
+
 script.on_event(defines.events.on_tick, function(event)
+	--if _reset2 then _reset2() end
+	--_reset2 = nil
+	
 	polling(event)
 	optimized_update()
 end)
@@ -892,7 +897,7 @@ script.on_event(defines.events.on_selected_entity_changed, function(event)
 	local pl = storage.players[id]
 	if pl then
 		local e = event.last_entity
-		pl.sel = e and storage.all_displays[e.unit_number]
+		pl[10] = e and storage.all_displays[e.unit_number]
 	end
 end)
 
@@ -1004,10 +1009,11 @@ end
 script.on_configuration_changed(function(data)
 	local changes = data.mod_changes["hexcoder-signal-display"]
 	if not changes then return end
-	_reset()
 end)
 
 -- removed to not clutter up /help
 commands.add_command("hexcoder-signal-display-reset", nil, function(command)
 	_reset()
 end)
+
+_reset2 = _reset
