@@ -18,6 +18,7 @@ storage = storage
 ---@field buckets table<surface_index, table<bucket_key, Bucket>>
 ---@field draw_lists Bucket[]
 ---@field players table<player_index, Player>
+---@field opened_guis table<unit_number, Display>
 ---@field need_rebuild boolean
 
 ---@class Display
@@ -28,6 +29,7 @@ storage = storage
 ---@field ac2 LuaEntity?
 ---@field sid integer
 ---@field chunk_key bucket_key
+---@field last_updated tick_num?
 
 ---@class Bucket
 ---@field [1] tick_num? -- last_updated
@@ -138,6 +140,12 @@ local function _dbg_chunk(key, col)
 	rendering.draw_line{ from={ x=x1, y=y1 }, to={ x=x0, y=y1 }, color=col, width=10, surface=surf, time_to_live=1, render_mode="chart" }
 	rendering.draw_line{ from={ x=x0, y=y1 }, to={ x=x0, y=y0 }, color=col, width=10, surface=surf, time_to_live=1, render_mode="chart" }
 end
+local function _dbg_AABB(x0,x1,y0,y1, surface, color)
+	rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x0, y= y1 }, color=color, width=4, surface=surface, time_to_live=1 }
+	rendering.draw_line{ from={ x=x1, y=y0 }, to={ x=x1, y= y1 }, color=color, width=4, surface=surface, time_to_live=1 }
+	rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x1, y= y0 }, color=color, width=4, surface=surface, time_to_live=1 }
+	rendering.draw_line{ from={ x=x0, y=y1 }, to={ x=x1, y= y1 }, color=color, width=4, surface=surface, time_to_live=1 }
+end
 
 ---@param data Display
 ---@param list Display[]
@@ -234,9 +242,8 @@ end
 ---@returns boolean
 -- any circuit connection not going to hidden change detector
 local function is_actually_connected(c)
-	return c and
-	  (c.real_connection_count >= 2 or
-	   c.real_connection_count >= 1 and c.real_connections[1].origin ~= WO_SCRIPT)
+	local count = c.real_connection_count
+	return count >= 2 or count >= 1 and c.real_connections[1].origin ~= WO_SCRIPT
 end
 
 local update_messages
@@ -245,13 +252,6 @@ local update_messages
 ---@param ctrl LuaDisplayPanelControlBehavior?
 ---@returns boolean
 local function is_active_display(display, ctrl)
-	-- may be needed in multiplayer? sounds overkill
-	for _, player in pairs(game.players) do
-		if player.opened_gui_type == GT_ENTITY and display == player.opened then
-			return false
-		end
-	end
-	
 	-- need to return false if display not connected to circuit to avoid display updating despite no circuit
 	-- (and overwriting static user message since ctrl.messages still exists despite being hidden)
 	if display.valid and ctrl then
@@ -306,6 +306,11 @@ end
 local function check_display(display)
 	local id = display.unit_number ---@cast id -nil
 	local data = storage.all_displays[id]
+	
+	if storage.opened_guis[id] then
+		return -- don't touch!
+	end
+	
 	if not data then
 		script.register_on_object_destroyed(display)
 		
@@ -330,7 +335,7 @@ local function check_display(display)
 		
 		local function update_combinator(wire)
 			local d_conn = d_conns and d_conns[wire]
-			local connected = is_actually_connected(d_conn)
+			local connected = d_conn and is_actually_connected(d_conn)
 			local ac = acs[wire]
 			if (ac ~= nil) == connected then
 				return false -- nothing to do
@@ -442,6 +447,18 @@ update_messages = function(data)
 	-- I had a decent version of preventing exceeding 500 chars when showing multiple signals, but ran into the fact that the line cutoff still breaks color/font
 	-- so it's pointless to do, I now let the game itself cutoff get_all_signals_text()
 	
+	-- don't update while gui is open, via check so we avoid having to mess with buckets which can cause rebuilds
+	if storage.opened_guis[display.unit_number] then
+		return -- don't touch!
+	end
+	
+	-- skip double updates for alt/chart overlaps, or alt + hovered as it is cheap compared to actual update
+	local tick = game.tick
+	if game.tick == data.last_updated then
+		return
+	end
+	data.last_updated = tick
+	
 	--_dbg_update(display)
 	
 	-- cache in case multiple messages exist
@@ -541,11 +558,22 @@ update_messages = function(data)
 				elseif virt_name == "signal-each" then
 					text = get_all_signals_text(text)
 				elseif virt_name == "signal-anything" then
-					-- this is one tick behind (I think?)
-					local any_icon = display.display_panel_icon
-					if any_icon and any_icon.name then
-						text = get_signal_text(text, any_icon)
-					end
+					-- this is one tick behind (oI think?)
+					-- yes -> it appears that if change detection only triggers on one tick, this can acutally get stuck displaying 0
+					-- TODO: need to either figure out a way to do find the same icon that will appear in display_panel_icon without actually knowing
+					-- or update for one more tick after change detect (ugh...)
+					-- if I'm lucky display.get_signals(CR, CG)[1] is that signal...
+					
+					--local any_icon = display.display_panel_icon
+					--if any_icon and any_icon.name then
+					--	text = get_signal_text(text, any_icon)
+					--end
+					
+					-- Seems to be working, the unsorted signals appear to be in a fixed order (order like in UI / internal ID order?)
+					-- it's inefficient but I do change detection, so...!
+					all_signals = all_signals or display.get_signals(CR, CG)
+					local any_signal_count = all_signals and all_signals[1].count or 0
+					text = format_count_text(text, any_signal_count)
 				else
 					-- show signal count
 					text = get_signal_text(text, icon)
@@ -558,32 +586,37 @@ update_messages = function(data)
 	end
 end
 
-local function polling(event)
-	-- update entire list and thus each entity exactly once every period
-	local period = 90
-	local list = storage.poll_list
-	local ratio = (event.tick % period) + 1 -- +1 only works with tick freq=1, period must be divisible by this, so 1 is good
-	local last = math.ceil((ratio / period) * #list)
-	
-	for i=storage.poll_cur,last do
-		check_display(list[i].entity)
-		
-		--_dbg_disp(list[i].entity, {.2,.2,1})
+-- Tick for convenience feature
+---@param display LuaEntity
+local function tick_gui(display)
+	local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
+	if ctrl then
+		for i,m in ipairs(ctrl.messages) do
+			if m.icon and m.icon.type == "virtual" then
+				-- convenience feature: its annoying that when connecting circuit to display panel by default it shows nothing
+				if m.text == nil and m.condition == nil then
+					m.text = "{}"
+					m.condition = ANY_SIGNAL_COND
+					ctrl.set_message(i,m)
+				end
+			end
+		end
 	end
-	
-	if ratio == period then -- end of list reached
-		storage.poll_cur = 1
-	else
-		storage.poll_cur = last+1
+	-- ctrl.set_message(i,m) does not actually cause the gui to update
+	-- if condition is not already fulfilled or something, this fixes that
+	if not display.display_panel_always_show then
+		display.display_panel_always_show = true
+		display.display_panel_always_show = false
 	end
 end
-
-local function _dbg_AABB(x0,x1,y0,y1, surface, color)
-	rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x0, y= y1 }, color=color, width=4, surface=surface, time_to_live=1 }
-	rendering.draw_line{ from={ x=x1, y=y0 }, to={ x=x1, y= y1 }, color=color, width=4, surface=surface, time_to_live=1 }
-	rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x1, y= y0 }, color=color, width=4, surface=surface, time_to_live=1 }
-	rendering.draw_line{ from={ x=x0, y=y1 }, to={ x=x1, y= y1 }, color=color, width=4, surface=surface, time_to_live=1 }
-end
+script.on_nth_tick(12, function(event)
+	for _,player in pairs(game.players) do
+		local entity = player.opened_gui_type == GT_ENTITY and player.opened or nil --[[@as LuaEntity?]]
+		if is_display_planel(entity) then ---@cast entity DisplayEntity
+			tick_gui(entity)
+		end
+	end
+end)
 
 local view_margin = 3
 -- unlike many games, zoom is not tied to vertical or horizontal fov/orthographic diameter
@@ -594,6 +627,7 @@ local zoom_scale = 0.5/32 -- could listen to on_player_display_resolution_change
 local function rebuild_drawlists()
 	local set = {}
 	local draw_lists = {}
+	local _total = 0
 	
 	local players = storage.players
 	for _, player in pairs(game.connected_players) do
@@ -607,10 +641,6 @@ local function rebuild_drawlists()
 		local chart = mode == RM_CHART
 		local alt = player.game_view_settings.show_entity_info
 		pl.mode = mode
-		
-		--local sel = player.selected -- hovered
-		--local open = player.opened
-		--game.print("".. serpent.block(player.render_mode))
 		
 		local pos = player.position
 		-- player chunk index
@@ -658,6 +688,7 @@ local function rebuild_drawlists()
 				if bucket and not set[bucket] then
 					set[bucket] = bucket
 					table.insert(draw_lists, bucket)
+					_total = _total + #bucket[2]
 				end
 			elseif alt then
 				pl.alt = true
@@ -670,6 +701,7 @@ local function rebuild_drawlists()
 						if bucket and not set[bucket] then
 							set[bucket] = bucket
 							table.insert(draw_lists, bucket)
+							_total = _total + #bucket[2]
 						end
 					end
 				end
@@ -692,34 +724,7 @@ local function rebuild_drawlists()
 		--end
 	storage.draw_lists = draw_lists
 	
-	game.print("rebuild_drawlists: ".. serpent.line(game.tick))
-end
-
----@returns boolean
-local function check_player()
-	local players = storage.players
-	for _, player in pairs(game.connected_players) do
-		local pl = players[player.index]
-		
-		local mode = player.render_mode
-		if not pl or mode ~= pl.mode then
-			return true
-		end
-		
-		if pl.alt then
-			local zoom = player.zoom
-			if zoom ~= pl.zoom then
-				local f = zoom_scale / zoom
-				local half_sizeX = ceil((pl.resX * f + view_margin) / 32)
-				local half_sizeY = ceil((pl.resY * f + view_margin) / 32)
-				if half_sizeX ~= pl.half_sizeX or half_sizeY ~= pl.half_sizeY then
-					return true
-				end
-				pl.zoom = zoom
-			end
-		end
-	end
-	return false
+	game.print(string.format("rebuild_drawlists: at %d: buckets: %d displays: %d", game.tick, #draw_lists, _total))
 end
 
 script.on_event(defines.events.on_player_changed_position, function(event)
@@ -744,27 +749,95 @@ script.on_event(defines.events.on_player_changed_position, function(event)
 	end
 end)
 
+script.on_event({
+	defines.events.on_player_joined_game,
+	defines.events.on_player_left_game,
+	defines.events.on_player_respawned,
+	defines.events.on_player_changed_surface,
+	defines.events.on_player_controller_changed,
+	defines.events.on_player_display_resolution_changed,
+	--defines.events.on_player_display_scale_changed,
+	defines.events.on_player_toggled_alt_mode,
+}, rebuild_drawlists)
+
+-- Choose to not react to undo/redo, blueprinting or wire changes even is technically possible via various techniques or libraries
+-- but it is very, very complicated and not worth it over polling
+-- I tried blueprint lib + perel + custom undo/redo handlers, and it still did not work correctly
+-- polling checks all displays for possible changes, the cost is probably ok
+-- not sure if there's any point to try to optimize this other than the rate
+-- -> like somehow knowing when a display is more likely to need it, robots place things nearby, player is nearby etc.
+
+local function polling(event)
+	-- update entire list and thus each entity exactly once every period
+	local period = 300 -- 5 seconds are bearable, and should keep the overhead low
+	local list = storage.poll_list
+	local ratio = (event.tick % period) + 1 -- +1 only works with tick freq=1, period must be divisible by this, so 1 is good
+	local last = math.ceil((ratio / period) * #list)
+	
+	for i=storage.poll_cur,last do
+		check_display(list[i].entity)
+		
+		--_dbg_disp(list[i].entity, {.2,.2,1})
+	end
+	
+	if ratio == period then -- end of list reached
+		storage.poll_cur = 1
+	else
+		storage.poll_cur = last+1
+	end
+end
+
 local function optimized_update()
+	
 	local need_rebuild = storage.need_rebuild
-	if need_rebuild or check_player() --[[or (game.tick%300==0)]] then
+	local players = storage.players
+	
+	local connected = game.connected_players
+	for pi=1,#connected do
+		local player = connected[pi]
+		local pl = players[player.index]
+		
+		local mode = player.render_mode
+		if not pl or mode ~= pl.mode then
+			-- rebuild if player switched to/from char view
+			need_rebuild = true
+		elseif pl.alt then
+			local zoom = player.zoom
+			if zoom ~= pl.zoom then
+				local f = zoom_scale / zoom
+				local half_sizeX = ceil((pl.resX * f + view_margin) / 32)
+				local half_sizeY = ceil((pl.resY * f + view_margin) / 32)
+				if half_sizeX ~= pl.half_sizeX or half_sizeY ~= pl.half_sizeY then
+					need_rebuild = true
+				end
+				pl.zoom = zoom
+			end
+			
+			if pl.sel then
+				update_messages(pl.sel)
+			end
+		end
+	end
+	
+	if need_rebuild --[[or (game.tick%300==0)]] then
 		storage.need_rebuild = false
 		rebuild_drawlists()
 	end
 	
-	for _, player in pairs(game.connected_players) do
-		local pl = storage.players[player.index]
-		local x0 = pl.posX - pl.half_sizeX
-		local x1 = pl.posX + pl.half_sizeX
-		local y0 = pl.posY - pl.half_sizeY
-		local y1 = pl.posY + pl.half_sizeY
-		_dbg_AABB(x0*32, x1*32+32, y0*32,y1*32+32, player.surface, {1,1,.2})
-		
-		x0 = x0+1
-		x1 = x1-1
-		y0 = y0+1
-		y1 = y1-1
-		_dbg_AABB(x0*32, x1*32+32, y0*32,y1*32+32, player.surface, {0,1,.2})
-	end
+	--for _, player in pairs(game.connected_players) do
+	--	local pl = storage.players[player.index]
+	--	local x0 = pl.posX - pl.half_sizeX
+	--	local x1 = pl.posX + pl.half_sizeX
+	--	local y0 = pl.posY - pl.half_sizeY
+	--	local y1 = pl.posY + pl.half_sizeY
+	--	_dbg_AABB(x0*32, x1*32+32, y0*32,y1*32+32, player.surface, {1,1,.2})
+	--	
+	--	x0 = x0+1
+	--	x1 = x1-1
+	--	y0 = y0+1
+	--	y1 = y1-1
+	--	_dbg_AABB(x0*32, x1*32+32, y0*32,y1*32+32, player.surface, {0,1,.2})
+	--end
 	
 	local draw_lists = storage.draw_lists
 	
@@ -778,7 +851,7 @@ local function optimized_update()
 		
 		bucket[1] = tick
 		
-		_dbg_chunk(entity_chunk_pos(list[1].entity), {1,.2,.2})
+		--_dbg_chunk(entity_chunk_pos(list[1].entity), {1,.2,.2})
 		
 		if last_updated ~= last_tick then
 			-- slowpath, chunk was not observed last tick
@@ -788,14 +861,14 @@ local function optimized_update()
 				local data = list[i]
 				update_messages(data)
 				
-				_dbg_disp(data.entity, {.2,1,.2})
+				--_dbg_disp(data.entity, {.2,1,.2})
 			end
 		else
 			-- fastpath, do circuit change detection
 			for i=1,#list do
 				local data = list[i]
 				-- Cool optimization: edge detector AC, read combined inputs (current + negated_previous tick signals) if get_signals()=nil, then no change
-				-- Need 2 to catch red and green wires (could usually avoid get_signals if wire connect/disconnect was an event, but unclear how slow 1 API call actually is vs the extra check in lua
+				-- Need 2 to catch red and green wires, but second get_signals likely is rare
 				-- This change detection only works if we also updated this display last tick!
 				local b = data.ac2
 				if data.ac1.get_signals(CR, CG) or (b and b.get_signals(CR, CG)) then
@@ -803,60 +876,24 @@ local function optimized_update()
 					
 					--_dbg_disp(data.entity, {.2,1,.2})
 				end
-				_dbg_disp(data.entity, {.2,1,.2})
+				--_dbg_disp(data.entity, {.2,1,.2})
 			end
 		end
 	end
 end
-
-script.on_event({
-	defines.events.on_player_joined_game,
-	defines.events.on_player_left_game,
-	defines.events.on_player_respawned,
-	defines.events.on_player_changed_surface,
-	defines.events.on_player_controller_changed,
-	defines.events.on_player_display_resolution_changed,
-	--defines.events.on_player_display_scale_changed,
-	defines.events.on_player_toggled_alt_mode,
-}, rebuild_drawlists)
-
--- Tick for convenience feature
----@param display LuaEntity
-local function tick_gui(display)
-	local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
-	if ctrl then
-		for i,m in ipairs(ctrl.messages) do
-			if m.icon and m.icon.type == "virtual" then
-				-- convenience feature: its annoying that when connecting circuit to display panel by default it shows nothing
-				if m.text == nil and m.condition == nil then
-					m.text = "{}"
-					m.condition = ANY_SIGNAL_COND
-					ctrl.set_message(i,m)
-				end
-			end
-		end
-	end
-	-- ctrl.set_message(i,m) does not actually cause the gui to update
-	-- if condition is not already fulfilled or something, this fixes that
-	if not display.display_panel_always_show then
-		display.display_panel_always_show = true
-		display.display_panel_always_show = false
-	end
-end
-script.on_nth_tick(12, function(event)
-	for _,player in pairs(game.players) do
-		local entity = player.opened_gui_type == GT_ENTITY and player.opened or nil --[[@as LuaEntity?]]
-		if entity and entity.valid and entity.type == "display-panel" then
-			tick_gui(entity)
-		end
-	end
-end)
 
 script.on_event(defines.events.on_tick, function(event)
-	--if true then return end
-	
 	polling(event)
 	optimized_update()
+end)
+
+script.on_event(defines.events.on_selected_entity_changed, function(event)
+	local id = event.player_index
+	local pl = storage.players[id]
+	if pl then
+		local e = event.last_entity
+		pl.sel = e and storage.all_displays[e.unit_number]
+	end
 end)
 
 local function on_entity_event(event)
@@ -866,16 +903,47 @@ local function on_entity_event(event)
 		check_display(entity)
 	end
 end
+
 script.on_event(defines.events.on_gui_opened, function(event)
 	local entity = event.entity
 	if is_display_planel(entity) then ---@cast entity DisplayEntity
+		local pid = event.player_index
 		local data = storage.all_displays[entity.unit_number]
 		if data then
-			reset_display(data) -- TODO: don't remove from buckets for efficiency, simply skip update in update_messages?
+			local pl = storage.players[pid] or {}
+			local open = storage.opened_guis or {}
+			
+			pl.open = entity
+			open[entity.unit_number] = data
+			
+			storage.players[pid] = pl
+			
+			--reset_display(data) -- TODO: don't remove from buckets for efficiency, simply skip update in update_messages?
+			reset_messages(data)
 		end
 	end
 end)
-script.on_event(defines.events.on_gui_closed, on_entity_event) -- TODO: only check display after checking that all players have closed it?
+script.on_event(defines.events.on_gui_closed, function(event)
+	local entity = event.entity
+	if is_display_planel(entity) then ---@cast entity DisplayEntity
+		local pid = event.player_index
+		local pl = storage.players[pid] or {}
+		pl.open = nil
+		storage.players[pid] = pl
+		
+		-- may be needed in multiplayer? sounds overkill
+		for _, pl in pairs(storage.players) do
+			if pl.open == entity then
+				return -- still open
+			end
+		end
+		
+		local open = storage.opened_guis or {}
+		open[entity.unit_number] = nil
+		
+		check_display(entity) -- reactivate display once no gui open
+	end
+end)
 
 -- React to the all entity create events
 for _, event in pairs({
@@ -890,10 +958,6 @@ for _, event in pairs({
 end
 -- React to the all simple entity settings paste
 script.on_event(defines.events.on_entity_settings_pasted, on_entity_event) -- source to destination
-
--- Choose to not react to undo/redo, blueprinting or wire changes even is technically possible via various techniques or libraries
--- but it is very, very complicated and not worth it over polling
--- I tried blueprint lib + perel + custom undo/redo handlers, and it still did not work correctly
 
 deathrattles[defines.target_type.surface] = function(event)
 	storage.buckets[event.useful_id] = nil
@@ -917,6 +981,7 @@ local function init()
 	storage.buckets = {}
 	storage.draw_lists = {}
 	storage.players = {}
+	storage.opened_guis = {}
 	storage.need_rebuild = true
 	
 	for _, surface in pairs(game.surfaces) do
