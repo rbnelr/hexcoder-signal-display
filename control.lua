@@ -1,43 +1,50 @@
+--[[
+This is a mod that makes display panels able to show circuit signal counts in real time by inserting text into '{}' found in the display messages
+Showing all signals sorted like the game guis do when hovering is fully supported
+The game sadly limits the string to 500 characters, this is a maximum of around 20 signals (less if the numbers are big)
+In alt mode there is an additional limitation in pixel width of what is considered one line, this is a maximum of around 12 signals
 
----@type ModStorage
-storage = storage
+-- Number formatting:
 
----@class player_index : integer
----@class surface_index : integer
----@class unit_number : integer
----@class bucket_key : integer
----@class tick_num : integer
+*Show the raw integer by default
+*I currently choose not to display large number as 1.0k or 5M like the game does, but if wanted this could be implemented
+*Instead I do support fixed point values, which I often use with circuit (ex 1.23 is represented as a signal of 1230)
+ to use this put something like /1000f3 _anywhere_ inside the message and signal=1234567 becomes 123.457 (.4567 rounds to .457)
+ the format is /<divisor>f<precision>
+  no spaces allowed, I'd support more flexibility but lua regexes are very limited
+  divisor can be int (1000) or float (0.1) and can be negative, precision must be an int
 
----@class DisplayEntity : LuaEntity
+-- Change detection:
 
----@class ModStorage
----@field all_displays table<unit_number, Display>
----@field poll_list Display[]
----@field poll_idx table<Display, integer>
----@field poll_cur integer
----@field buckets table<surface_index, table<bucket_key, Bucket>>
----@field draw_lists Bucket[]
----@field players table<player_index, Player>
----@field opened_guis table<unit_number, Display>
----@field need_rebuild boolean
+I use one hidden arithmetic combinator per wire connected to the display panel for change detection (each*-1=>each wired to it's other input wire)
+This allows me to check when to update the messages with a single API call, allowing hundreds of displays to be on-screen wiht minimal tick cost if they update infrequently
 
----@class Display
----@field entity DisplayEntity
----@field ctrl LuaDisplayPanelControlBehavior?
----@field acs? table<defines.wire_connector_id.circuit_red|defines.wire_connector_id.circuit_green, LuaEntity?>
----@field [1] LuaEntity? -- ac1 (Use array since it's supposedly faster)
----@field [2] LuaEntity? -- ac2
----@field sid integer
----@field chunk_key bucket_key
----@field last_updated tick_num?
+currently I detect changes to all signals even if only a single signal is shown, could seperate them out but would still need 1 API call either way TODO: test perf of that?
 
----@class Bucket -- Use array since it's supposedly faster
----@field [1] tick_num? -- last_updated
----@field [2] Display[] -- draw list
----@field [3] table<Display, bucket_key> -- draw list index map
+this adds no delay, since I'm reading the current+previous circuit signals directly of the entity (summed by the engine)
+sadly on the engine side it likely sums the signals every time, but best case there are no changes and it returns nil, which should be good for performance
+writing the display message add one tick of delay, this sounds bad, but control behaviors also all only happen one tick after the signal appears
+This means my display actualy updates in sync with eg. a circuit enabled lamps turning on, but it is one tick delays compared to the game gui showing signals
 
----@class Player
----@field [any] any -- TODO:
+note that this combiator-based change detection only works if tested every tick, so when displays become visibile I have to fall back to full updates
+
+-- Visibility optimization:
+
+I seperate displays into lists depending on the surface, their display mode (hover-only, chart, alt or chart+alt), and recently also their chunk position
+I check all players using events where possible, zoom and render mode are checked every tick
+Displays are tracked based on 32-tile chunks per surface, called buckets here, any chart-mode displays go into a special single bucket
+I determine the exact view AABBs based on zoom level and find visible chunks, player movment and zoom use minimal code to find when visible chunks change
+If player has walked or zoomed enough, the list of unique buckets is rebuilt fully
+The main drawing code based on these draw lists is then pretty fast
+
+]]
+
+local DEBUG = false
+
+-- Limit max signals for Everything (sum) and Each (list) modes for performance
+-- TODO: could make this configurable
+local MAX_SIGNALS = 16
+local POLLING_PERIOD = 300 -- 5 seconds are bearable, and should keep the overhead low
 
 local floor = math.floor
 local ceil = math.ceil
@@ -74,22 +81,25 @@ local AC_NEGATE_EACH_G = { ---@type ArithmeticCombinatorParameters
 	output_signal={type="virtual", name="signal-each"}
 }
 
-
-local CHART_KEY = 1 / 0  -- inf, can never collide with any real chunk key
-
--- MapPosition x/y  32bit with 8bits fractional => 24 bits units range (presumably signed)
--- => chunk_pos range is 2^23 / 32 => chunk pos should be [-262144, 262144)
+-- MapPosition x/y are signed 32bit with 8bits fractional => signed 24 bit tiles range
+-- => chunk_pos range could be +-2^23 / 32 (19 bit) => chunk pos in [-262144, 262144)
+-- But actually the map is limited to exactly +-1,000,000, with a few chunks around that still generating, so chunks should safely fit in +- 2^15
 -- chunks at y=0 are keys=[-CHUNK_HALF_RANGE, CHUNK_HALF_RANGE)
 --           y=1 are keys=[CHUNK_HALF_RANGE, CHUNK_HALF_RANGE*3) and so on
-local CHUNK_HALF_RANGE = 262144 -- 2^23 / 32
-local CHUNK_RANGE = 524288 -- 2^24 / 32
+--local CHUNK_HALF_RANGE = 262144 -- 2^23 / 32
+--local CHUNK_RANGE = 524288 -- 2^24 / 32
+local CHUNK_RANGE = 65536 -- 2^16
+
+-- Special bucket key for all chart mode displays
+local CHART_KEY = 1 / 0  -- inf, can never collide with any real chunk key
 
 ---@param x integer
 ---@param y integer
 ---@returns bucket_key
 local function chunk_key(x, y)
 	-- x and y fit in double mantissa safely without collision
-	return y * CHUNK_RANGE + x
+	-- reversing this requires is a bit arkward due to negative x values (divmod + if) I think this could be fixed by biasing via x+CHUNK_RANGE/2
+	return y * CHUNK_RANGE + x --[[@as bucket_key]]
 end
 
 ---@param key bucket_key
@@ -97,7 +107,7 @@ end
 local function chunk_key2pos(key)
 	local x = key % CHUNK_RANGE
 	local y = floor(key / CHUNK_RANGE)
-	if x < CHUNK_HALF_RANGE then
+	if x < CHUNK_RANGE/2 then
 		return x, y
 	end
 	return x - CHUNK_RANGE, y + 1
@@ -119,26 +129,28 @@ local function _dbg_disp(display, col)
 	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y-0.45 }, to={ x=pos.x+0.45, y=pos.y+0.45 }, color=col, width=6, surface=display.surface, time_to_live=1, render_mode="chart" }
 	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y+0.45 }, to={ x=pos.x+0.45, y=pos.y-0.45 }, color=col, width=6, surface=display.surface, time_to_live=1, render_mode="chart" }
 end
-local function _dbg_chunk(key, col)
+local function _dbg_bucket(bucket, col, time)
+	local key = bucket.chunk_key
 	if key == CHART_KEY then return end
 	
 	local x,y = chunk_key2pos(key)
-	local surf = game.get_player(1).surface
+	local surf = bucket.surfID
 	
 	local x0 = x*32 + 0.4
 	local y0 = y*32 + 0.4
 	local x1 = x*32 + 31.6
 	local y1 = y*32 + 31.6
 	
-	rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x1, y=y0 }, color=col, width=2, surface=surf, time_to_live=1 }
-	rendering.draw_line{ from={ x=x1, y=y0 }, to={ x=x1, y=y1 }, color=col, width=2, surface=surf, time_to_live=1 }
-	rendering.draw_line{ from={ x=x1, y=y1 }, to={ x=x0, y=y1 }, color=col, width=2, surface=surf, time_to_live=1 }
-	rendering.draw_line{ from={ x=x0, y=y1 }, to={ x=x0, y=y0 }, color=col, width=2, surface=surf, time_to_live=1 }
+	time = time or 1
+	rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x1, y=y0 }, color=col, width=2, surface=surf, time_to_live=time }
+	rendering.draw_line{ from={ x=x1, y=y0 }, to={ x=x1, y=y1 }, color=col, width=2, surface=surf, time_to_live=time }
+	rendering.draw_line{ from={ x=x1, y=y1 }, to={ x=x0, y=y1 }, color=col, width=2, surface=surf, time_to_live=time }
+	rendering.draw_line{ from={ x=x0, y=y1 }, to={ x=x0, y=y0 }, color=col, width=2, surface=surf, time_to_live=time }
 	
-	rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x1, y=y0 }, color=col, width=10, surface=surf, time_to_live=1, render_mode="chart" }
-	rendering.draw_line{ from={ x=x1, y=y0 }, to={ x=x1, y=y1 }, color=col, width=10, surface=surf, time_to_live=1, render_mode="chart" }
-	rendering.draw_line{ from={ x=x1, y=y1 }, to={ x=x0, y=y1 }, color=col, width=10, surface=surf, time_to_live=1, render_mode="chart" }
-	rendering.draw_line{ from={ x=x0, y=y1 }, to={ x=x0, y=y0 }, color=col, width=10, surface=surf, time_to_live=1, render_mode="chart" }
+	rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x1, y=y0 }, color=col, width=10, surface=surf, time_to_live=time, render_mode="chart" }
+	rendering.draw_line{ from={ x=x1, y=y0 }, to={ x=x1, y=y1 }, color=col, width=10, surface=surf, time_to_live=time, render_mode="chart" }
+	rendering.draw_line{ from={ x=x1, y=y1 }, to={ x=x0, y=y1 }, color=col, width=10, surface=surf, time_to_live=time, render_mode="chart" }
+	rendering.draw_line{ from={ x=x0, y=y1 }, to={ x=x0, y=y0 }, color=col, width=10, surface=surf, time_to_live=time, render_mode="chart" }
 end
 local function _dbg_AABB(x0,x1,y0,y1, surface, color)
 	rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x0, y= y1 }, color=color, width=4, surface=surface, time_to_live=1 }
@@ -181,7 +193,7 @@ local function remove_from_poll_list(disp)
 	remove_from_array(disp, storage.poll_list, storage.poll_idx)
 end
 
----@param surf table<integer, Bucket>
+---@param surf SurfaceBuckets
 ---@param key bucket_key
 ---@param disp Display
 ---@param insert boolean
@@ -190,20 +202,20 @@ local function add_or_remove_in_bucket(surf, key, disp, insert)
 	local bucket = surf[key]
 	if insert then
 		if not bucket then
-			bucket = { [2]={}, [3]={} }
+			bucket = { draw_list={}, indexes={}, chunk_key=key, surfID=surf._surfID }
 			surf[key] = bucket
 			storage.need_rebuild = true
 		end
 		
-		local idxs = bucket[3]
+		local idxs = bucket.indexes
 		if not idxs[disp] then
-			add_to_array(disp, bucket[2], idxs)
-			return true
+			add_to_array(disp, bucket.draw_list, idxs)
+			--return true
 		end
 	elseif bucket then
-		local idxs = bucket[3]
+		local idxs = bucket.indexes
 		if idxs[disp] then
-			local list = bucket[2]
+			local list = bucket.draw_list
 			remove_from_array(disp, list, idxs)
 			
 			if #list == 0 then
@@ -212,18 +224,18 @@ local function add_or_remove_in_bucket(surf, key, disp, insert)
 			end
 		end
 	end
-	return false
+	--return false
 end
 
----@param surf table<integer, Bucket>
+---@param surf SurfaceBuckets
 ---@param key bucket_key
 ---@param disp Display
 local function try_remove_from_bucket(surf, key, disp)
 	local bucket = surf[key]
 	if bucket then
-		local idxs = bucket[3]
+		local idxs = bucket.indexes
 		if idxs[disp] then
-			local list = bucket[2]
+			local list = bucket.draw_list
 			remove_from_array(disp, list, idxs)
 			
 			if #list == 0 then
@@ -234,22 +246,8 @@ local function try_remove_from_bucket(surf, key, disp)
 	end
 end
 
----@param e LuaEntity?
----@returns boolean
-local function is_display_panel(e)
-	return e and e.valid and e.type == "display-panel"
-end
-
----@param c LuaWireConnector?
----@returns boolean
--- any circuit connection not going to hidden change detector
-local function is_actually_connected(c)
-	if not c then return false end
-	local count = c.real_connection_count
-	return count >= 2 or count >= 1 and c.real_connections[1].origin ~= WO_SCRIPT
-end
-
-local update_messages
+local update_messages -- forward declare
+local cache_format_strings
 
 ---@param display DisplayEntity
 ---@param ctrl LuaDisplayPanelControlBehavior?
@@ -284,18 +282,26 @@ local function reset_messages(data)
 	end
 end
 
--- stop updating, clean messages so user can properly edit
+local FALLBACK_FORMAT = { num_form="{ %d }", form="%s [%s=%s] %d", formQ="%s [%s=%s,quality=%s] %d", div=1 }
+
+---@param e LuaEntity?
+---@returns boolean
+local function is_display_panel(e)
+	return e and e.valid and e.type == "display-panel"
+end
+
+-- stop updating, destroy ACs and clean messages
 ---@param data Display
 local function reset_display(data)
 	-- reset messages even if not data yet, relevant for copy-pasted entities
 	reset_messages(data)
 	
-	for _,ac in pairs(data.acs) do
-		ac.destroy()
-	end
-	data.acs = {}
-	data[1] = nil -- ac1
-	data[2] = nil -- ac2
+	if data.acR then data.acR.destroy() end
+	if data.acG then data.acG.destroy() end
+	data.acR = nil
+	data.acG = nil
+	
+	data.format_cache = nil
 	
 	local surf = storage.buckets[data.sid]
 	if surf then
@@ -304,63 +310,85 @@ local function reset_display(data)
 	end
 end
 
+---@param id unit_number
+local function delete_display(id)
+	local data = storage.all_displays[id]
+	if data then
+		reset_display(data)
+		remove_from_poll_list(data)
+		storage.all_displays[id] = nil
+	end
+end
+
 -- start or stop updating display depending on if any messages contain format trigger {}
 ---@param display DisplayEntity
-local function check_display(display)
-	local id = display.unit_number ---@cast id -nil
+---@param data? Display
+local function check_display(display, data)
+	local from_poll = data ~= nil
 	
+	local id = display.unit_number ---@cast id -nil
 	if storage.opened_guis[id] then
 		return -- don't touch!
 	end
 	
-	local data = storage.all_displays[id]
+	if DEBUG and display and display.valid then _dbg_disp(display, {.2,.2,1}) end
+	
+	-- create Display data if not seen yet (built or init/migrate)
+	data = data or storage.all_displays[id]
 	if not data then
 		script.register_on_object_destroyed(display)
 		
 		data = {
 			entity = display,
-			acs = {},
 			sid = display.surface_index,
-			chunk_key = entity_chunk_pos(display)
+			chunk_key = entity_chunk_pos(display),
 		}
 		add_to_poll_list(data)
 		storage.all_displays[id] = data
 	end
 	
-	data.ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
+	-- cache control behavior
+	data.ctrl = data.ctrl or display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
 	
-	local active = is_active_display(display, data.ctrl)
-	local need_update = false
+	-- check if display actually has messages to update, if not reset
+	local is_active = is_active_display(display, data.ctrl)
 	
-	if active then
+	if is_active then
 		local d_conns = display.get_wire_connectors(false)
-		local acs = data.acs ---@cast acs -nil
 		
-		local function update_combinator(wire)
+		---@param name "acR"|"acG"
+		---@param wire defines.wire_connector_id
+		local function update_combinator(name, wire)
 			local d_conn = d_conns and d_conns[wire]
-			local ac = acs[wire]
-			if (ac ~= nil) == is_actually_connected(d_conn) then
+			local ac = data[name] --[[@as LuaEntity]]
+			
+			local actually_connected = false
+			if d_conn then 
+				local count = d_conn.real_connection_count
+				actually_connected = count >= 2 or count >= 1 and d_conn.real_connections[1].origin ~= WO_SCRIPT
+			end
+			
+			if (ac ~= nil) == actually_connected then
 				return false -- nothing to do
 			end
 			
 			if ac then
 				ac.destroy()
-				acs[wire] = nil
-				return true
+				data[name] = nil
+				return
 			end
 			
-			ac = display.surface.create_entity{
+			ac = display.surface.create_entity({
 				name="hexcoder-signal-display-hidden-change-detector", force=display.force,
-				position={display.position.x + (wire == CR and -0.4 or 0.4), display.position.y-1.5}, snap_to_grid=false,
+				position={display.position.x + (name == "acR" and -0.4 or 0.4), display.position.y-1.5}, snap_to_grid=false,
 				direction=defines.direction.north
-			} ---@cast ac -nil
+			}) --[[@as LuaEntity]]
 			ac.destructible = false
 			
 			local ctrl = ac.get_or_create_control_behavior() --[[@as LuaArithmeticCombinatorControlBehavior]]
-			
 			local ac_conn = ac.get_wire_connectors(true)
 			
-			if wire == CR then
+			if name == "acR" then
 				ctrl.parameters = AC_NEGATE_EACH_R
 				ac_conn[W.combinator_input_red  ].connect_to(d_conn, false, WO_SCRIPT)
 				ac_conn[W.combinator_input_green].connect_to(ac_conn[W.combinator_output_green], false, WO_SCRIPT)
@@ -370,35 +398,32 @@ local function check_display(display)
 				ac_conn[W.combinator_input_green].connect_to(d_conn, false, WO_SCRIPT)
 			end
 			
-			acs[wire] = ac
-			return true
+			data[name] = ac
 		end
 		
-		need_update = update_combinator(CR) or need_update
-		need_update = update_combinator(CG) or need_update
-		if need_update then
-			if acs[CR] then
-				data[1] = acs[CR]
-				data[2] = acs[CG]
-			else
-				data[1] = acs[CG]
-			end
-		end
+		update_combinator("acR", CR)
+		update_combinator("acG", CG)
 	end
-	if active and data[1] then
+	if is_active and (data.acR or data.acG) then
 		-- add to update appropriate update lists
 		local surf = storage.buckets[data.sid]
 		if not surf then
 			script.register_on_object_destroyed(display.surface)
-			surf = {}
+			surf = { _surfID=data.sid }
 			storage.buckets[data.sid] = surf
 			storage.need_rebuild = true
 		end
 		
-		need_update = add_or_remove_in_bucket(surf, CHART_KEY, data, display.display_panel_show_in_chart) or need_update
-		need_update = add_or_remove_in_bucket(surf, data.chunk_key, data, display.display_panel_always_show) or need_update
+		add_or_remove_in_bucket(surf, CHART_KEY, data, display.display_panel_show_in_chart)
+		add_or_remove_in_bucket(surf, data.chunk_key, data, display.display_panel_always_show)
 		
-		if need_update then
+		-- Ugh, even with slow tick actually these are really slow
+		-- Unfortunately, I'm not even sure how to detect changes to the message at reasonable performance
+		-- right now just update format strings and 
+		if not from_poll then
+			-- cache format strings TODO: should check for message changes to avoid constantly doing this in polling
+			cache_format_strings(data)
+			
 			-- ensure update, as change detection might not trigger after creation
 			-- let future ticks be handled by change detection
 			update_messages(data)
@@ -408,27 +433,114 @@ local function check_display(display)
 	end
 end
 
-local deathrattles = {}
-deathrattles[defines.target_type.entity] = function(event)
-	local data = storage.all_displays[event.useful_id]
-	if data then
-		reset_display(data)
-		remove_from_poll_list(data)
-		storage.all_displays[event.useful_id] = nil
-	end
-end
-
 local function _comp_signal(l, r)
 	return l.count > r.count
 end
 
--- TODO: use /editor to look at the exact tick delay my display has
--- change detection adds no delay, since I'm reading the current+previous signals directly (summed by the engine)
--- the engine either susm red+green on the API call or has the sum already cached, there's a chance that since the change detector.get_signals returns nil, it's fater than usual
--- writing the display message may get displayed in the tick, or next tick, I haven't checked
--- a circuit network might show iron=1 (was 0) on tick=0, a control behavior like a lamp turning on if iron>0 actually lights up one tick later at tick=1, my display matches this! (showing iron=1 at tick=1)
--- -> either get_signals add the delay, or setting the message, but I belive it should be the message
--- -> LuaEntity.get_signals supposedly is "current", ie the same as the the in-game gui should show
+-- Cache format strings as determining them is quite complex because of my fixed point format support
+-- This updates during check ie. during setup and edits but also when polling
+---@param data Display
+cache_format_strings = function(data)
+	local display = data.entity
+	
+	if storage.opened_guis[display.unit_number] or not (data.acR or data.acG) then
+		return -- don't touch!
+	end
+	
+	-- during tick handler, display_panel_text will be from last tick and the condition may cause a different text based on current signals
+	-- the easy solution is to update all messages every tick
+	
+	local formats = {}
+	
+	local ctrl = data.ctrl
+	if ctrl and ctrl.valid then
+		for i,m in ipairs(ctrl.messages) do
+			local text = m.text
+			
+			if text then
+				-- fixed-point display support, accept this anywhere inside the message
+				-- ideally would be to put it into {} but then I'd have to avoid replacing it in the regex gsub
+				local divisor, precision = m.text:match("/(%d+)f(%d+)")
+				local fmt = nil
+				if divisor then
+					local div = tonumber(divisor)
+					
+					local num_form = precision and string.format("{ %%.%df }", precision)
+					
+					local num_format2 = precision and string.format("%%.%df", precision)
+					
+					-- rich text is: [item=copper-plate] or for non-normal quality: [item=copper-plate,quality=epic]
+					local form = "%s [%s=%s] "..num_format2
+					local formQ = "%s [%s=%s,quality=%s] "..num_format2
+					
+					fmt = { num_form=num_form, form=form, formQ=formQ, div=div }
+				end
+				formats[i] = fmt
+			end
+		end
+	end
+	
+	data.format_cache = table_size(formats) > 0 and formats or nil
+end
+
+---@param input string
+---@param count integer
+---@param F FormatStrings
+---@returns string
+local function format_count_text(input, count, F)
+	-- TODO: string.format + regex.gsub sounds close to optimal, but...
+	-- TODO: since I now cache num_form in polling I could also cache the entire format string instead
+	-- which would remove the regex!
+	return input:gsub("{[^{}]*}", string.format(F.num_form, count / F.div), 1)
+end
+---@param input string
+---@param all_signals Signal[]?
+---@param F FormatStrings
+---@returns string
+local function get_all_signals_sum_text(input, all_signals, F)
+	-- Is the the only way to do this?
+	local count = 0
+	if all_signals then
+		for _,sig in ipairs(all_signals) do
+			count = count + sig.count
+		end
+	end
+	
+	return format_count_text(input, count, F)
+end
+---@param input string
+---@param all_signals Signal[]?
+---@param F FormatStrings
+---@returns string
+local function get_all_signals_text(input, all_signals, F)
+	if not all_signals or all_signals[1] == nil then
+		return input:gsub("{[^{}]*}", "{}", 1)
+	end
+	
+	table.sort(all_signals, _comp_signal)
+	
+	-- limit signals to 16 for now, as only about that much fit in 500 char limit anyway
+	all_signals[MAX_SIGNALS+1] = nil
+	
+	-- the string.format here is needed every tick, but signals tend to not change that much, might be able to cache more here
+	-- -> could cache [%s=%s,quality=%s] entirely, but unclear how to construct key fast
+	local text = "{"
+	for _,s in ipairs(all_signals) do
+		local sig = s.signal
+		local type = sig.type
+		local typeS = type and SIGNAL2RICH_TEXT[type] or "item"
+		local Q = sig.quality
+		if Q then
+			text = string.format(F.formQ, text, typeS, sig.name, Q, s.count/F.div)
+		else
+			text = string.format(F.form, text, typeS, sig.name, s.count/F.div)
+		end
+	end
+	
+	-- TODO: supposedly pushing individual formatted strings into a list, then doing  table.concat(str_list) could be faster
+	-- test this by disabling change detect and possibly using LuaProfiler?
+	return input:gsub("{[^{}]*}", text.." }", 1)
+end
 
 ---@param data Display
 update_messages = function(data)
@@ -461,133 +573,67 @@ update_messages = function(data)
 	end
 	data.last_updated = tick
 	
-	--_dbg_update(display)
+	if DEBUG then _dbg_disp(data.entity, {.2,1,.2}) end
 	
 	-- cache in case multiple messages exist
 	local all_signals = nil
 	
-	---@param input string
-	---@param count integer
-	---@returns string
-	local function format_count_text(input, count)
-		local divisor, precision = input:match("/(%d+)f(%d+)")
-		local div = tonumber(divisor) or 1
-		--local num_format = precision and string.format("{ [font=default-bold]%%.%df[/font] }", precision) or "{ [font=default-bold]%d[/font] }"
-		local num_format = precision and string.format("{ %%.%df }", precision) or "{ %d }"
-		
-		-- TODO: string.format + regex.gsub sounds close to optimal, but...
-		-- since I'm now polling, it's acceptable to return the wrong result until the poll happens, so I can cache the format string based on the message
-		-- which could remove the regex!
-		return input:gsub("{[^{}]*}", string.format(num_format, count / div), 1)
-	end
-	
-	---@param input string
-	---@returns string
-	local function get_all_signals_sum_text(input)
-		all_signals = all_signals or display.get_signals(CR, CG)
-		
-		-- Is the the only way to do this?
-		local count = 0
-		if all_signals then
-			for _,sig in ipairs(all_signals) do
-				count = count + sig.count
-			end
-		end
-		
-		return format_count_text(input, count)
-	end
-	---@param input string
-	---@returns string
-	local function get_all_signals_text(input)
-		all_signals = all_signals or display.get_signals(CR, CG)
-		if not all_signals or next(all_signals) == nil then
-			return input:gsub("{[^{}]*}", "{}", 1)
-		end
-		
-		local limit = 17 -- 16+1
-		all_signals[limit] = nil
-		
-		table.sort(all_signals, _comp_signal)
-		
-		-- TODO: I don't know performance characteristics of lua, but creating new strings might be slow
-		-- -> consider optimizing by caching this in storage: /(%d+)f(%d+) -> form/formQ (via polling)
-		
-		-- support fixed point values: /1000f3 => signal=1234567 -> 123.457 (.4567 rounded to .457)
-		-- don't support more variations due to heavy lua regex limitations
-		local divisor, precision = input:match("/(%d+)f(%d+)")
-		local div = tonumber(divisor) or 1
-		local num_format = precision and string.format("%%.%df", precision) or "%d"
-		
-		-- rich text is: [item=copper-plate] or for non-normal quality: [item=copper-plate,quality=epic]
-		local form = "%s [%s=%s] "..num_format
-		local formQ = "%s [%s=%s,quality=%s] "..num_format
-		
-		-- the string.format here is needed every tick, but signals tend to not change that much, might be able to cache more here
-		-- -> could cache [%s=%s,quality=%s] entirely, but unclear how what to use as key
-		-- TODO: since items are most common and appear with sig.type=nil, could add fastpath for it instead of formatting in "item", not sur?
-		local text = "{"
-		for _,s in ipairs(all_signals) do
-			local sig = s.signal
-			local type = SIGNAL2RICH_TEXT[sig.type] or "item"
-			if not sig.quality then
-				text = string.format(form, text, type,sig.name, s.count/div)
-			else
-				text = string.format(formQ, text, type,sig.name,sig.quality, s.count/div)
-			end
-			-- TODO: stop after 10 items or so, or track string length at stop at 500 at the latest
-			-- about 12 signals per line if each has count=1, and at ~20 I reach 500 char limit
-		end
-		
-		-- TODO: supposedly pushing individual formatted strings into a list, then doing  table.concat(str_list) could be faster
-		-- test this by disabling change detect and possibly using LuaProfiler?
-		return input:gsub("{[^{}]*}", text.." }", 1)
-	end
-	---@param input string
-	---@param icon SignalID
-	---@returns string
-	local function get_signal_text(input, icon)
-		local count = display.get_signal(icon, CR, CG) or 0
-		
-		return format_count_text(input, count)
-	end
-	
 	-- during tick handler, display_panel_text will be from last tick and the condition may cause a different text based on current signals
 	-- the easy solution is to update all messages every tick
+	
+	local fmt = data.format_cache
 	
 	local ctrl = data.ctrl
 	if ctrl and ctrl.valid then
 		for i,m in ipairs(ctrl.messages) do
 			local icon = m.icon
 			local text = m.text
+			local F = fmt and fmt[i] or FALLBACK_FORMAT
 			
 			if text and icon.name then
-				local virt_name = icon.type == "virtual" and icon.name or nil
-				if virt_name == "signal-everything" then
-					text = get_all_signals_sum_text(text)
-				elseif virt_name == "signal-each" then
-					text = get_all_signals_text(text)
-				elseif virt_name == "signal-anything" then
-					-- this is one tick behind (oI think?)
-					-- yes -> it appears that if change detection only triggers on one tick, this can acutally get stuck displaying 0
-					-- TODO: need to either figure out a way to do find the same icon that will appear in display_panel_icon without actually knowing
-					-- or update for one more tick after change detect (ugh...)
-					-- if I'm lucky display.get_signals(CR, CG)[1] is that signal...
-					
-					--local any_icon = display.display_panel_icon
-					--if any_icon and any_icon.name then
-					--	text = get_signal_text(text, any_icon)
-					--end
-					
-					-- Seems to be working, the unsorted signals appear to be in a fixed order (order like in UI / internal ID order?)
-					-- it's inefficient but I do change detection, so...!
-					all_signals = all_signals or display.get_signals(CR, CG)
-					
-					local any_signal = all_signals and all_signals[1]
-					local any_signal_count = any_signal and any_signal.count or 0
-					text = format_count_text(text, any_signal_count)
+				local name = icon.name
+				if icon.type == "virtual" then
+					if name == "signal-each" then
+						all_signals = all_signals or display.get_signals(CR, CG)
+						
+						text = get_all_signals_text(text, all_signals, F)
+					elseif name == "signal-everything" then
+						all_signals = all_signals or display.get_signals(CR, CG)
+						
+						text = get_all_signals_sum_text(text, all_signals, F)
+					elseif name == "signal-anything" then
+						
+						-- this is one tick behind (I think?)
+						-- yes -> it appears that if change detection only triggers on one tick, this can acutally get stuck displaying 0
+						-- TODO: need to either figure out a way to do find the same icon that will appear in display_panel_icon without actually knowing
+						-- or update for one more tick after change detect (ugh...)
+						-- if I'm lucky display.get_signals(CR, CG)[1] is that signal...
+						
+						--local any_icon = display.display_panel_icon
+						--if any_icon and any_icon.name then
+						--	text = get_signal_text(text, any_icon)
+						--end
+						
+						-- Seems to be working, the unsorted signals appear to be in a fixed order (order like in UI / internal ID order?)
+						-- it's inefficient but I do change detection, so...!
+						all_signals = all_signals or display.get_signals(CR, CG)
+						local any_signal_count = 0
+						if all_signals then
+							local any_signal = all_signals[1]
+							if any_signal then
+								any_signal_count = any_signal.count
+							end
+						end
+						text = format_count_text(text, any_signal_count, F)
+					else
+						-- show virtual signal count
+						local count = display.get_signal(icon, CR, CG) or 0
+						text = format_count_text(text, count, F)
+					end
 				else
 					-- show signal count
-					text = get_signal_text(text, icon)
+					local count = display.get_signal(icon, CR, CG) or 0
+					text = format_count_text(text, count, F)
 				end
 				
 				m.text = text
@@ -629,21 +675,18 @@ script.on_nth_tick(12, function(event)
 	end
 end)
 
-local view_margin = 3
--- unlike many games, zoom is not tied to vertical or horizontal fov/orthographic diameter
--- instead at zoom=1: 1 tile is drawn at 32 pixels at my specific window resolution, 2 is zoomed in to 1tile=64px
--- I hope this is actually correct for a all setups
+local view_margin = 3 -- absolute extra tiles around screen to render, probably not perfect
+-- unlike many games, zoom is not tied to aspect ration, instead being directly related to resolution
+-- at zoom=1: 1 tile == 32 pixels, zoom=2 1 tile == 64 pixels
 local zoom_scale = 0.5/32 -- could listen to on_player_display_resolution_changed
 
 local function rebuild_drawlists()
-	local set = {}
 	local draw_lists = {}
-	local _total = 0
 	
 	local players = storage.players
 	for _, player in pairs(game.connected_players) do
 		local pl = players[player.index]
-		if not pl then
+		if not pl then -- lazy init just to be safe
 			pl = {}
 			players[player.index] = pl
 		end
@@ -651,7 +694,7 @@ local function rebuild_drawlists()
 		local mode = player.render_mode
 		local chart = mode == RM_CHART
 		local alt = player.game_view_settings.show_entity_info
-		pl[1] = mode
+		pl.render_mode = mode
 		
 		local pos = player.position
 		-- player chunk index
@@ -660,23 +703,18 @@ local function rebuild_drawlists()
 		
 		local zoom = player.zoom
 		local res = player.display_resolution
-		--local scale = player.display_scale
+		-- what does these actually do? my zoom computation seems correct
+		--local scale = player.display_scale -- may only affect GUI?
 		--local density = player.display_density_scale
 		
-		local f = zoom_scale / zoom
+		local tiles_per_px = zoom_scale / zoom
 		-- player view
-		local half_sizeX = ceil((res.width * f + view_margin) / 32)
-		local half_sizeY = ceil((res.height * f + view_margin) / 32)
+		local half_sizeX = ceil((res.width * tiles_per_px + view_margin) / 32)
+		local half_sizeY = ceil((res.height * tiles_per_px + view_margin) / 32)
 		
-		--player.zoom_limits = {
-		--	closest = { zoom = 4 },
-		--	furthest = { distance = 800, max_distance = 1000 },
-		--	furthest_game_view = { distance = 800, max_distance = 1000 }
-		--}
-		
-		pl[3] = zoom
-		pl[4] = posX
-		pl[5] = posY
+		pl.posX = posX
+		pl.posY = posY
+		pl.zoom = zoom
 		pl.half_sizeX = half_sizeX
 		pl.half_sizeY = half_sizeY
 		pl.resX = res.width
@@ -688,61 +726,51 @@ local function rebuild_drawlists()
 		local y0 = posY - half_sizeY
 		local y1 = posY + half_sizeY
 		
+		pl.alt_mode = false
+		
 		-- TODO: optimize via on_player_toggled_alt_mode + ?
 		-- sadly chart mode does not seem to have en event? poll that one infrequently?
 		local surf = storage.buckets[player.surface_index]
 		if surf then
-			
-			pl[2] = false
 			if chart then -- game view or char_zoomed_in render actual entities, chart is map mode
 				local bucket = surf[CHART_KEY]
-				if bucket and not set[bucket] then
-					set[bucket] = bucket
-					table.insert(draw_lists, bucket)
-					_total = _total + #bucket[2]
+				if bucket then
+					draw_lists[bucket] = true
 				end
 			elseif alt then
-				pl[2] = true
-				
+				pl.alt_mode = true
 				for y=y0,y1 do
-					local keyY = CHUNK_RANGE*y
 					for x=x0,x1 do
-						local key = keyY+x
+						local key = chunk_key(x,y)
 						local bucket = surf[key]
-						if bucket and not set[bucket] then
-							set[bucket] = bucket
-							table.insert(draw_lists, bucket)
-							_total = _total + #bucket[2]
+						if bucket then
+							draw_lists[bucket] = true
 						end
 					end
 				end
 			end
 		end
 	end
-		---- TODO: This should be optimized via on_selected_entity_changed and on_gui_opened/closed
-		--local open_id = player.opened_gui_type == GT_ENTITY and player.opened.unit_number or nil
-		--
-		--local sel_id = player.selected and player.selected.unit_number
-		--local data = sel_id and sel_id ~= open_id and storage.all_displays[sel_id] or nil
-		--if data then ---@cast sel_id -nil
-		--	extra_update[sel_id] = data
-		--end
-		--
-		---- weird logic, and doens't even work if player 1 has ui open, and player 2 hovers it
-		---- TODO: optimize by just not removing from update list on open, remove this check here, and then just skip if update_messages actually happens?
-		--if open_id then
-		--	extra_update[open_id] = nil
-		--end
-	storage.draw_lists = draw_lists
 	
-	game.print(string.format("rebuild_drawlists: at %d: buckets: %d displays: %d", game.tick, #draw_lists, _total))
+	if DEBUG then
+		local _total = 0
+		for bucket, _ in pairs(draw_lists) do
+			_total = _total + #bucket.draw_list
+			
+			--if not storage.draw_lists[bucket] then _dbg_bucket(bucket, {1,.2,1}, 60) end
+		end
+		
+		game.print(string.format("rebuild_drawlists: at %d: buckets: %d displays: %d", game.tick, table_size(draw_lists), _total))
+	end
+	
+	storage.draw_lists = draw_lists
 end
 
 script.on_event(defines.events.on_player_changed_position, function(event)
 	-- player moved by one tile
 	local id = event.player_index
 	local pl = storage.players[id]
-	if pl and pl[2] then
+	if pl and pl.alt_mode then
 		local player = game.get_player(id) ---@cast player -nil
 		local pos = player.position
 		--local surf = player.surface
@@ -750,11 +778,10 @@ script.on_event(defines.events.on_player_changed_position, function(event)
 		--local psurf = player.physical_surface
 		--game.print("on_player_changed_position: ".. serpent.line({ pos, surf, ppos, psurf, event }), {skip=defines.print_skip.never})
 		
-		-- if moved into another chunk while in map_view and 
 		-- player chunk index
 		local posX = floor(pos.x / 32)
 		local posY = floor(pos.y / 32)
-		if posX ~= pl[4] or posY ~= pl[5] then
+		if posX ~= pl.posX or posY ~= pl.posY then -- player moved to another chunk
 			storage.need_rebuild = true
 		end
 	end
@@ -779,17 +806,20 @@ script.on_event({
 -- -> like somehow knowing when a display is more likely to need it, robots place things nearby, player is nearby etc.
 
 local function polling(event)
-	-- update entire list and thus each entity exactly once every period
-	local period = 300 -- 5 seconds are bearable, and should keep the overhead low
+	-- update each entity exactly once every period
+	-- should be safe to resize list or change POLLING_PERIOD without updating poll_cur
+	local period = POLLING_PERIOD
 	local list = storage.poll_list
 	local ratio = (event.tick % period) + 1 -- +1 only works with tick freq=1, period must be divisible by this, so 1 is good
 	local last = math.ceil((ratio / period) * #list)
 	
 	for i=storage.poll_cur,last do
-		local e = list[i].entity
+		local data = list[i]
+		local e = data.entity
+		-- .valid check is supposedly needed even with on_object_destroyed
+		-- check nil as well just to be safe
 		if e and e.valid then
-			check_display(list[i].entity)
-			--_dbg_disp(list[i].entity, {.2,.2,1})
+			check_display(e, data)
 		end
 	end
 	
@@ -801,7 +831,6 @@ local function polling(event)
 end
 
 local function optimized_update()
-	
 	local need_rebuild = storage.need_rebuild
 	local players = storage.players
 	
@@ -811,96 +840,68 @@ local function optimized_update()
 		local pl = players[player.index]
 		
 		local mode = player.render_mode
-		if not pl or mode ~= pl[1] then
+		if not pl or mode ~= pl.render_mode then
 			-- rebuild if player switched to/from char view
 			need_rebuild = true
-		elseif pl[2] then
+		elseif pl.alt_mode then
 			local zoom = player.zoom
-			if zoom ~= pl[3] then
+			if zoom ~= pl.zoom then -- avoid some computation if zoom did not change
 				local f = zoom_scale / zoom
 				local half_sizeX = ceil((pl.resX * f + view_margin) / 32)
 				local half_sizeY = ceil((pl.resY * f + view_margin) / 32)
 				if half_sizeX ~= pl.half_sizeX or half_sizeY ~= pl.half_sizeY then
 					need_rebuild = true
 				end
-				pl[3] = zoom
+				pl.zoom = zoom
 			end
 			
-			if pl[10] then
-				update_messages(pl[10])
+			if pl.selected then
+				update_messages(pl.selected)
 			end
 		end
 	end
 	
-	if need_rebuild --[[or (game.tick%300==0)]] then
+	if need_rebuild then
 		storage.need_rebuild = false
 		rebuild_drawlists()
 	end
-	
-	--for _, player in pairs(game.connected_players) do
-	--	local pl = storage.players[player.index]
-	--	local x0 = pl[4] - pl.half_sizeX
-	--	local x1 = pl[4] + pl.half_sizeX
-	--	local y0 = pl[5] - pl.half_sizeY
-	--	local y1 = pl[5] + pl.half_sizeY
-	--	_dbg_AABB(x0*32, x1*32+32, y0*32,y1*32+32, player.surface, {1,1,.2})
-	--	
-	--	x0 = x0+1
-	--	x1 = x1-1
-	--	y0 = y0+1
-	--	y1 = y1-1
-	--	_dbg_AABB(x0*32, x1*32+32, y0*32,y1*32+32, player.surface, {0,1,.2})
-	--end
 	
 	local draw_lists = storage.draw_lists
 	
 	local tick = game.tick
 	local last_tick = tick-1
 	
-	for b=1,#draw_lists do
-		local bucket = draw_lists[b]
-		local last_updated = bucket[1]
-		local list = bucket[2]
+	for bucket, _ in pairs(draw_lists) do
+		local last_updated = bucket.last_updated
+		bucket.last_updated = tick
+		local list = bucket.draw_list
 		
-		bucket[1] = tick
+		if DEBUG then _dbg_bucket(bucket, {1,.2,.2}) end
 		
-		--_dbg_chunk(entity_chunk_pos(list[1].entity), {1,.2,.2})
-		
-		if last_updated ~= last_tick then
+		if last_updated == last_tick then
+			-- fastpath, do circuit change detection
+			for i=1,#list do
+				local data = list[i]
+				-- This change detection only works if we also updated this display last tick!
+				local r = data.acR
+				local g = data.acG
+				if (r and r.get_signals(CR, CG)) or (g and g.get_signals(CR, CG)) then
+					update_messages(data)
+				end
+			end
+		else
 			-- slowpath, chunk was not observed last tick
 			-- Due to new chunk, alt mode toggle, enter/exit chart mode, surface switch, new player, player moved or zoomed etc.
 			-- change detect ACs not valid since did not update this list last tick
 			for i=1,#list do
 				local data = list[i]
 				update_messages(data)
-				
-				--_dbg_disp(data.entity, {.2,1,.2})
-			end
-		else
-			-- fastpath, do circuit change detection
-			for i=1,#list do
-				local data = list[i]
-				-- Cool optimization: edge detector AC, read combined inputs (current + negated_previous tick signals) if get_signals()=nil, then no change
-				-- Need 2 to catch red and green wires, but second get_signals likely is rare
-				-- This change detection only works if we also updated this display last tick!
-				local b = data[2]
-				if data[1].get_signals(CR, CG) or (b and b.get_signals(CR, CG)) then
-					update_messages(data)
-					
-					--_dbg_disp(data.entity, {.2,1,.2})
-				end
-				--_dbg_disp(data.entity, {.2,1,.2})
 			end
 		end
 	end
 end
 
-local _reset2
-
 script.on_event(defines.events.on_tick, function(event)
-	--if _reset2 then _reset2() end
-	--_reset2 = nil
-	
 	polling(event)
 	optimized_update()
 end)
@@ -912,7 +913,7 @@ script.on_event(defines.events.on_selected_entity_changed, function(event)
 	if pl then
 		local player = game.get_player(id) ---@cast player -nil
 		local e = player.selected
-		pl[10] = e and storage.all_displays[e.unit_number]
+		pl.selected = e and storage.all_displays[e.unit_number]
 	end
 end)
 
@@ -931,14 +932,12 @@ script.on_event(defines.events.on_gui_opened, function(event)
 		local data = storage.all_displays[entity.unit_number]
 		if data then
 			local pl = storage.players[pid] or {}
-			local open = storage.opened_guis or {}
-			
 			pl.open = entity
-			open[entity.unit_number] = data
-			
 			storage.players[pid] = pl
+			storage.opened_guis[entity.unit_number] = data
 			
-			--reset_display(data) -- TODO: don't remove from buckets for efficiency, simply skip update in update_messages?
+			--used to call reset_display but it's better to not touch buckets for efficiency, simply skip update in update_messages instead
+			-- just reset messages for cleaner user edits
 			reset_messages(data)
 		end
 	end
@@ -951,15 +950,14 @@ script.on_event(defines.events.on_gui_closed, function(event)
 		pl.open = nil
 		storage.players[pid] = pl
 		
-		-- may be needed in multiplayer? sounds overkill
+		-- can multiple people actually open the same entity? if so I think this makes sense to correctly _not_ update if any have it open
 		for _, pl in pairs(storage.players) do
 			if pl.open == entity then
 				return -- still open
 			end
 		end
 		
-		local open = storage.opened_guis or {}
-		open[entity.unit_number] = nil
+		storage.opened_guis[entity.unit_number] = nil
 		
 		check_display(entity) -- reactivate display once no gui open
 	end
@@ -976,9 +974,15 @@ for _, event in pairs({
 }) do
 	script.on_event(event, on_entity_event, {{filter="type", type="display-panel"}})
 end
--- React to the all simple entity settings paste
+-- React to entity settings paste
 script.on_event(defines.events.on_entity_settings_pasted, on_entity_event) -- source to destination
 
+-- Don't try to handle all possibilities of settings and wires being changed as it is barely possible, polling is more reliable
+-- don't react to undo/redo changing settings as it is too complex
+-- don't react to circuit wire add/remove as there are no events (perel is great but does not handle blueprint-over and undo/redo)
+-- don't react to blueprinting as it already mostly works, and blueprinting over is very complex (but blueprint lib is nice)
+
+local deathrattles = {} ---@type function(EventData.on_object_destroyed)[]
 deathrattles[defines.target_type.surface] = function(event)
 	storage.buckets[event.useful_id] = nil
 	rebuild_drawlists()
@@ -986,6 +990,9 @@ end
 deathrattles[defines.target_type.player] = function(event)
 	storage.players[event.useful_id] = nil
 	rebuild_drawlists()
+end
+deathrattles[defines.target_type.entity] = function(event)
+	delete_display(event.useful_id)
 end
 script.on_event(defines.events.on_object_destroyed, function(event)
 	local handler = deathrattles[event.type]
@@ -1032,4 +1039,134 @@ commands.add_command("hexcoder-signal-display-reset", nil, function(command)
 	_reset()
 end)
 
-_reset2 = _reset
+commands.add_command("profile1", nil, function(command)
+	local N = 10000000
+	
+	local s_tbl = { s1=1, s2=2, s3=3, s4=4, s5=5, s6=6, s7=7, s8=8, s9=9, s10=10 }
+	
+	local short =     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	local long =      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabb"
+	local very_long = "long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_"
+	s_tbl[short] = 11
+	s_tbl[long] = 12
+	s_tbl[very_long] = 13
+	
+	local short2 =     string.format("%saaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "a")
+	local long2 =      string.format("%saaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabb", "a")
+	local very_long2 = string.format("%s_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_",
+		"long")
+	
+	local a_tbl = {}; for i = 1, 10 do a_tbl[i] = i end
+	local f_tbl = {}; for i = 1, 10 do f_tbl[i + 0.5] = i end
+	
+	local ps = game.create_profiler(); for i = 1, N do
+		local _ = s_tbl.s3
+		local _ = s_tbl.s6
+		local _ = s_tbl.s9
+	end; ps.stop()
+	
+	local ps2 = game.create_profiler(); for i = 1, N do
+		local _ = s_tbl["s3"]
+		local _ = s_tbl["s6"]
+		local _ = s_tbl["s9"]
+	end; ps2.stop()
+	
+	local ps3 = game.create_profiler(); for i = 1, N do
+		local _ = s_tbl[short2]
+		local _ = s_tbl[short2]
+		local _ = s_tbl[short2]
+	end; ps3.stop()
+	
+	local ps4 = game.create_profiler(); for i = 1, N do
+		local _ = s_tbl[long2]
+		local _ = s_tbl[long2]
+		local _ = s_tbl[long2]
+	end; ps4.stop()
+	
+	local ps5 = game.create_profiler(); for i = 1, N do
+		local _ = s_tbl[very_long2]
+		local _ = s_tbl[very_long2]
+		local _ = s_tbl[very_long2]
+	end; ps5.stop()
+	
+	local pa = game.create_profiler(); for i = 1, N do
+		local _ = a_tbl[3]
+		local _ = a_tbl[6]
+		local _ = a_tbl[9]
+	end; pa.stop()
+	
+	local pf = game.create_profiler(); for i = 1, N do 
+		local _ = f_tbl[3.5]
+		local _ = f_tbl[6.5]
+		local _ = f_tbl[9.5]
+	end; pf.stop()
+	
+	game.player.print({ "", "  string_key=", ps,
+		"\nstring_key[str]=", ps2,
+		"\nstring_key[short]=", ps3, 
+		"\nstring_key[long]=", ps4, 
+		"\nstring_key[very_long]=", ps5, 
+		"\narray_index=", pa,
+		"\nfloat_key=", pf })
+end)
+
+---@type ModStorage
+storage = storage
+
+---@class player_index : integer
+---@class surface_index : integer
+---@class unit_number : integer
+---@class bucket_key : integer
+---@class tick_num : integer
+
+---@class DisplayEntity : LuaEntity
+
+---@class ModStorage
+---@field all_displays table<unit_number, Display>
+---@field poll_list Display[]
+---@field poll_idx table<Display, integer>
+---@field poll_cur integer
+---@field buckets table<surface_index, SurfaceBuckets>
+---@field draw_lists Bucket[]
+---@field players table<player_index, Player>
+---@field opened_guis table<unit_number, Display>
+---@field need_rebuild boolean
+
+---@class Display
+---@field entity DisplayEntity
+---@field ctrl? LuaDisplayPanelControlBehavior
+---@field acR? LuaEntity
+---@field acG? LuaEntity
+---@field sid integer
+---@field chunk_key bucket_key
+---@field last_updated tick_num?
+---@field format_cache? FormatStrings[]
+
+---@class FormatStrings
+---@field num_form string
+---@field form string
+---@field formQ string
+---@field div number
+
+---@class SurfaceBuckets
+---@field _surfID surface_index
+---@field [bucket_key] Bucket
+
+---@class Bucket
+---@field last_updated tick_num?
+---@field draw_list Display[]
+---@field indexes table<Display, bucket_key> -- draw list index map
+---@field surfID surface_index
+---@field chunk_key bucket_key
+
+---@class Player
+---@field render_mode defines.render_mode
+---@field alt_mode boolean
+---@field posX number
+---@field posY number
+---@field zoom number
+---@field resX number
+---@field resY number
+---@field half_sizeX number
+---@field half_sizeY number
+---@field selected LuaEntity?

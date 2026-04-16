@@ -1,7 +1,7 @@
 mod_name = "hexcoder-signal-display-"
 local dbg = false
 
-local function make_phantom(thing)
+local function make_hidden(thing)
 	thing.flags = {"not-on-map",
 		"not-rotatable", "not-flammable", "not-repairable",
 		"not-deconstructable", "not-blueprintable", "no-copy-paste", "not-upgradable",
@@ -62,6 +62,6 @@ end
 local ac = util.table.deepcopy(data.raw["arithmetic-combinator"]["arithmetic-combinator"])
 ac.name = mod_name.."hidden-change-detector"
 ac.energy_source = { type = "void" }
-make_phantom(ac)
+make_hidden(ac)
 
 data:extend({ac})
