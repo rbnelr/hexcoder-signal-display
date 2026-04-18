@@ -1,5 +1,5 @@
 mod_name = "hexcoder-signal-display-"
-local dbg = false
+local dbg = true
 
 local function make_hidden(thing)
 	thing.flags = {"not-on-map",
