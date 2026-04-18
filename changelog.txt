@@ -1,4 +1,12 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.0.2
+Date: 18. 04. 2026
+  Optimizations:
+    - Major optimization pass, now using chunking to only update near players for alt mode
+  Bugfixes:
+    - Added slow polling to fix certain cases where displays would not update until clicked (blueprint-over, undo-redo etc.)
+    - Fixed 
+---------------------------------------------------------------------------------------------------
 Version: 1.0.1
 Date: 13. 04. 2026
   Info:

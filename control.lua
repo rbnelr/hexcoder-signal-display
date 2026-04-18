@@ -28,16 +28,16 @@ This means my display actualy updates in sync with eg. a circuit enabled lamps t
 
 note that this combiator-based change detection only works if tested every tick, so when displays become visibile I have to fall back to full updates
 
--- TODO: checking a specific signal might be cheaper then checking all for nil and getting that in a memory cell would eliminate slowpath
-         but probably not possible without tick delay, which is my goal
+another finding: if a combinator is deleted, the change detection fails because apparently we still read the signals from it,
+  but the other circuits don't, meaning we never see the change -> have to actually force message updates like polling
 
 -- Visibility optimization:
 
 I seperate displays into lists depending on the surface, their display mode (hover-only, chart, alt or chart+alt), and recently also their chunk position
 I check all players using events where possible, zoom and render mode are checked every tick
-Displays are tracked based on 32-tile chunks per surface, called buckets here, any chart-mode displays go into a special single bucket
+Displays are tracked based on 32-tile chunks per surface, called chunks here, any chart-mode displays go into a special single chunk
 I determine the exact view AABBs based on zoom level and find visible chunks, player movment and zoom use minimal code to find when visible chunks change
-If player has walked or zoomed enough, the list of unique buckets is rebuilt fully
+If player has walked or zoomed enough, the list of unique chunks is rebuilt fully
 The main drawing code based on these draw lists is then pretty fast
 
 ]]
@@ -61,6 +61,7 @@ local CG = defines.wire_connector_id.circuit_green
 local WO_SCRIPT = defines.wire_origin.script
 local GT_ENTITY = defines.gui_type.entity
 local RM_CHART = defines.render_mode.chart
+local PRNT = {skip=defines.print_skip.never, sound=defines.print_sound.never}
 
 -- example tich text:
 -- [virtual-signal=signal-deny] [entity=big-biter]  [virtual-signal=signal-B]
@@ -96,19 +97,16 @@ local AC_NEGATE_EACH_G = { ---@type ArithmeticCombinatorParameters
 --local CHUNK_RANGE = 524288 -- 2^24 / 32
 local CHUNK_RANGE = 65536 -- 2^16
 
--- Special bucket key for all chart mode displays
-local CHART_KEY = 1 / 0  -- inf
-
 ---@param x integer
 ---@param y integer
----@return bucket_key
+---@return number
 local function chunk_key(x, y)
 	-- x and y fit in double mantissa safely without collision
 	-- reversing this requires is a bit arkward due to negative x values (divmod + if) I think this could be fixed by biasing via x+CHUNK_RANGE/2
-	return y * CHUNK_RANGE + x --[[@as bucket_key]]
+	return y * CHUNK_RANGE + x
 end
 
----@param key bucket_key
+---@param key number
 ---@return integer, integer
 local function chunk_key2pos(key)
 	local x = key % CHUNK_RANGE
@@ -120,102 +118,109 @@ local function chunk_key2pos(key)
 end
 
 ---@param entity LuaEntity
----@return bucket_key
+---@return chunk_key
 local function entity_chunk_pos(entity)
 	local pos = entity.position
 	return chunk_key(floor(pos.x / 32), floor(pos.y / 32))
 end
 
-local function _dbg_disp(display, col)
-	local pos = display.position
+local function _dbg_box(pos, size, surf, col, time)
+	local x0 = pos.x - size.x*0.5
+	local y0 = pos.y - size.y*0.5
+	local x1 = pos.x + size.x*0.5
+	local y1 = pos.y + size.y*0.5
+	time = time or 1
+	local A = { x=x0, y=y0 }
+	local B = { x=x1, y=y0 }
+	local C = { x=x1, y=y1 }
+	local D = { x=x0, y=y1 }
 	
-	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y-0.45 }, to={ x=pos.x+0.45, y=pos.y+0.45 }, color=col, width=2, surface=display.surface, time_to_live=1 }
-	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y+0.45 }, to={ x=pos.x+0.45, y=pos.y-0.45 }, color=col, width=2, surface=display.surface, time_to_live=1 }
+	rendering.draw_line{ from=A, to=B, color=col, width=2, surface=surf, time_to_live=time }
+	rendering.draw_line{ from=B, to=C, color=col, width=2, surface=surf, time_to_live=time }
+	rendering.draw_line{ from=C, to=D, color=col, width=2, surface=surf, time_to_live=time }
+	rendering.draw_line{ from=D, to=A, color=col, width=2, surface=surf, time_to_live=time }
 	
-	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y-0.45 }, to={ x=pos.x+0.45, y=pos.y+0.45 }, color=col, width=6, surface=display.surface, time_to_live=1, render_mode="chart" }
-	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y+0.45 }, to={ x=pos.x+0.45, y=pos.y-0.45 }, color=col, width=6, surface=display.surface, time_to_live=1, render_mode="chart" }
+	rendering.draw_line{ from=A, to=B, color=col, width=10, surface=surf, time_to_live=time, render_mode="chart" }
+	rendering.draw_line{ from=B, to=C, color=col, width=10, surface=surf, time_to_live=time, render_mode="chart" }
+	rendering.draw_line{ from=C, to=D, color=col, width=10, surface=surf, time_to_live=time, render_mode="chart" }
+	rendering.draw_line{ from=D, to=A, color=col, width=10, surface=surf, time_to_live=time, render_mode="chart" }
 end
-local function _dbg_bucket(bucket, col, time)
-	local key = bucket.chunk_key
-	if key == CHART_KEY then return end
+local function _dbg_X(pos, size, surf, col, time)
+	local x0 = pos.x - size.x*0.5
+	local y0 = pos.y - size.y*0.5
+	local x1 = pos.x + size.x*0.5
+	local y1 = pos.y + size.y*0.5
+	time = time or 1
+	local A = { x=x0, y=y0 }
+	local B = { x=x1, y=y0 }
+	local C = { x=x1, y=y1 }
+	local D = { x=x0, y=y1 }
+	
+	rendering.draw_line{ from=A, to=C, color=col, width=2, surface=surf, time_to_live=time }
+	rendering.draw_line{ from=B, to=D, color=col, width=2, surface=surf, time_to_live=time }
+	
+	rendering.draw_line{ from=A, to=C, color=col, width=6, surface=surf, time_to_live=time, render_mode="chart" }
+	rendering.draw_line{ from=B, to=D, color=col, width=6, surface=surf, time_to_live=time, render_mode="chart" }
+end
+local function _dbg_display(display, col)
+	_dbg_X(display.position, {x=0.8, y=0.8}, display.surface, col)
+end
+local function _dbg_chunk(chunk, col, time)
+	local key = chunk.chunk_key
+	if type(key) ~= "number" then return end
 	
 	local x,y = chunk_key2pos(key)
-	local surf = bucket.surfID
-	
-	local x0 = x*32 + 0.4
-	local y0 = y*32 + 0.4
-	local x1 = x*32 + 31.6
-	local y1 = y*32 + 31.6
-	
-	time = time or 1
-	rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x1, y=y0 }, color=col, width=2, surface=surf, time_to_live=time }
-	rendering.draw_line{ from={ x=x1, y=y0 }, to={ x=x1, y=y1 }, color=col, width=2, surface=surf, time_to_live=time }
-	rendering.draw_line{ from={ x=x1, y=y1 }, to={ x=x0, y=y1 }, color=col, width=2, surface=surf, time_to_live=time }
-	rendering.draw_line{ from={ x=x0, y=y1 }, to={ x=x0, y=y0 }, color=col, width=2, surface=surf, time_to_live=time }
-	
-	rendering.draw_line{ from={ x=x0, y=y0 }, to={ x=x1, y=y0 }, color=col, width=10, surface=surf, time_to_live=time, render_mode="chart" }
-	rendering.draw_line{ from={ x=x1, y=y0 }, to={ x=x1, y=y1 }, color=col, width=10, surface=surf, time_to_live=time, render_mode="chart" }
-	rendering.draw_line{ from={ x=x1, y=y1 }, to={ x=x0, y=y1 }, color=col, width=10, surface=surf, time_to_live=time, render_mode="chart" }
-	rendering.draw_line{ from={ x=x0, y=y1 }, to={ x=x0, y=y0 }, color=col, width=10, surface=surf, time_to_live=time, render_mode="chart" }
+	_dbg_box({x=x*32+16,y=y*32+16}, {x=31.8,y=31.8}, chunk.surfID, col, time)
 end
 
----@param data Display
----@param list Display[]
----@param idxs table<Display, integer>
-local function add_to_array(data, list, idxs)
-	assert(idxs[data] == nil)
-	local idx = #list + 1
-	list[idx] = data
-	idxs[data] = idx
+---@class DisplayList
+---@field [integer] Display -- Display[] (continuous array)
+---@field [Display] integer -- table<Display, integer> (index lookup)
+local DisplayList = {}
+DisplayList.__index = DisplayList
+
+---@return DisplayList
+function DisplayList.new()
+	return setmetatable({}, DisplayList)
 end
 ---@param data Display
----@param list Display[]
----@param idxs table<Display, integer>
-local function remove_from_array(data, list, idxs)
+function DisplayList:add(data)
+	assert(self[data] == nil)
+	local idx = #self + 1
+	self[idx] = data ; self[data] = idx
+end
+---@param data Display
+function DisplayList:remove(data)
 	-- delete by swap with last
-	local idx = idxs[data]
-	local last_idx = #list
-	
-	local last = list[last_idx]
-	list[idx] = last
-	idxs[last] = idx
-	
-	list[last_idx] = nil
-	idxs[data] = nil
+	local last_idx = #self
+	local idx  = self[data]     ; self[data] = nil
+	local last = self[last_idx] ; self[last_idx] = nil
+	self[idx] = last ; self[last] = idx
 end
 
----@param disp Display
-local function add_to_poll_list(disp)
-	add_to_array(disp, storage.poll_list, storage.poll_idx)
-end
----@param disp Display
-local function remove_from_poll_list(disp)
-	remove_from_array(disp, storage.poll_list, storage.poll_idx)
-end
-
----@param surf SurfaceBuckets
----@param key bucket_key
+---@param surf SurfaceChunks
+---@param key chunk_key
 ---@param disp Display
 ---@param insert boolean
----@return Bucket?
-local function add_or_remove_in_bucket(surf, key, disp, insert)
-	local bucket = surf[key]
+---@return Chunk?
+local function add_or_remove_in_chunk(surf, key, disp, insert)
+	local chunk = surf[key]
 	if insert then
-		if not bucket then
-			bucket = { draw_list={}, indexes={}, chunk_key=key, surfID=surf._surfID }
-			surf[key] = bucket
+		if not chunk then
+			chunk = { draw_list={}, indexes={}, chunk_key=key, surfID=surf._surfID }
+			surf[key] = chunk
 			storage.need_rebuild = true
 		end
 		
-		local idxs = bucket.indexes
+		local idxs = chunk.indexes
 		if not idxs[disp] then
-			add_to_array(disp, bucket.draw_list, idxs)
+			add_to_array(disp, chunk.draw_list, idxs)
 		end
-		return bucket -- is in bucket
-	elseif bucket then
-		local idxs = bucket.indexes
+		return chunk -- is in chunk
+	elseif chunk then
+		local idxs = chunk.indexes
 		if idxs[disp] then
-			local list = bucket.draw_list
+			local list = chunk.draw_list
 			remove_from_array(disp, list, idxs)
 			
 			if #list == 0 then
@@ -224,7 +229,7 @@ local function add_or_remove_in_bucket(surf, key, disp, insert)
 			end
 		end
 	end
-	return nil -- is not in bucket
+	return nil -- is not in chunk
 end
 
 local update_messages -- forward declare
@@ -264,10 +269,10 @@ local function reset_display(data)
 	data.acR = nil
 	data.acG = nil
 	
-	local surf = storage.buckets[data.sid]
+	local surf = storage.chunks[data.sid]
 	if surf then
-		data.chart = add_or_remove_in_bucket(surf, CHART_KEY, data, false)
-		data.alt = add_or_remove_in_bucket(surf, data.chunk_key, data, false)
+		data.chart = add_or_remove_in_chunk(surf, "chart", data, false)
+		data.alt = add_or_remove_in_chunk(surf, data.chunk_key, data, false)
 	end
 end
 
@@ -276,7 +281,7 @@ local function delete_display(id)
 	local data = storage.all_displays[id]
 	if data then
 		reset_display(data)
-		remove_from_poll_list(data)
+		delete_from_chunk(data)
 		storage.all_displays[id] = nil
 		
 		storage.opened_guis[id] = nil
@@ -326,7 +331,7 @@ local function update_display(display)
 		return -- don't touch!
 	end
 	
-	if DEBUG and display and display.valid then _dbg_disp(display, {.2,.2,1}) end
+	if DEBUG and display and display.valid then _dbg_display(display, {.2,.2,1}) end
 	
 	-- create Display data if not seen yet (built or init/migrate)
 	local data = storage.all_displays[id]
@@ -350,12 +355,12 @@ local function update_display(display)
 		
 		script.register_on_object_destroyed(display)
 		storage.all_displays[id] = data
-		add_to_poll_list(data)
+		add_to_chunk(data, chunk_key)
 		
 		-- lazily-create surface data here to avoid doing it during polling
-		if not storage.buckets[data.sid] then
+		if not storage.chunks[data.sid] then
 			script.register_on_object_destroyed(display.surface)
-			storage.buckets[data.sid] = { _surfID=data.sid }
+			storage.chunks[data.sid] = { _surfID=data.sid }
 			storage.need_rebuild = true
 		end
 	end
@@ -371,7 +376,7 @@ local function update_display(display)
 	local message_cache = {}
 	for i=1,#messages do local m = messages[i]
 		local cached = { text=m.text, icon=m.icon }
-		if m.icon and m.text and m.text:find("{[^{}]*}") then
+		if m.icon and m.icon.name and m.text and m.text:find("{[^{}]*}") then
 			cache_format(cached, m)
 			is_active = true
 		end
@@ -400,19 +405,17 @@ local function update_display(display)
 	end
 	if is_active then
 		-- add to update appropriate update lists
-		local surf = storage.buckets[data.sid]
+		local surf = storage.chunks[data.sid]
 		if not surf then
 			script.register_on_object_destroyed(display.surface)
 			surf = { _surfID=data.sid }
-			storage.buckets[data.sid] = surf
+			storage.chunks[data.sid] = surf
 			storage.need_rebuild = true
 		end
 		
-		data.chart = add_or_remove_in_bucket(surf, CHART_KEY, data, display.display_panel_show_in_chart)
-		data.alt = add_or_remove_in_bucket(surf, data.chunk_key, data, display.display_panel_always_show)
+		data.chart = add_or_remove_in_chunk(surf, "chart", data, display.display_panel_show_in_chart)
+		data.alt = add_or_remove_in_chunk(surf, data.chunk_key, data, display.display_panel_always_show)
 		
-		-- ensure update, as change detection might not trigger after creation
-		-- let future ticks be handled by change detection
 		update_messages(data)
 	else
 		reset_display(data)
@@ -425,39 +428,46 @@ end
 local function display_was_modified(data, entity)
 	local cached = data.message_cache
 	local messages = data.ctrl.messages
+	if #cached ~= #messages then
+		return true
+	end
 	for i=1,#messages do
 		local m = messages[i]
 		local c = cached[i]
 		local mi = m.icon
 		local ci = c.icon
-		if m.text ~= c.text then return true end
+		if m.text ~= c.text then
+			return true
+		end
 		if mi ~= nil then
 			if ci == nil or not (mi.type == ci.type and mi.name == ci.name and mi.quality == ci.quality) then
 				return true
 			end
 		else
-			if ci ~= nil then return true end
+			if ci ~= nil then
+				return true
+			end
 		end
 	end
 	
 	local activeR = data.acR ~= nil
 	local activeG = data.acG ~= nil
 	
+	local connR = data.connR
+	local countR = connR.real_connection_count
+	local actually_connectedR = countR >= 2 or countR >= 1 and connR.real_connections[1].origin ~= WO_SCRIPT
+	if activeR ~= actually_connectedR then
+		return true
+	end
+	
+	local connG = data.connG
+	local countG = connG.real_connection_count
+	local actually_connectedG = countG >= 2 or countG >= 1 and connG.real_connections[1].origin ~= WO_SCRIPT
+	if activeG ~= actually_connectedG then
+		return true
+	end
+		
 	if activeR or activeG then
-		local connR = data.connR
-		local countR = connR.real_connection_count
-		local actually_connectedR = countR >= 2 or countR >= 1 and connR.real_connections[1].origin ~= WO_SCRIPT
-		if activeR ~= actually_connectedR then
-			return true
-		end
-		
-		local connG = data.connG
-		local countG = connG.real_connection_count
-		local actually_connectedG = countG >= 2 or countG >= 1 and connG.real_connections[1].origin ~= WO_SCRIPT
-		if activeG ~= actually_connectedG then
-			return true
-		end
-		
 		if (data.chart ~= nil) ~= entity.display_panel_show_in_chart then
 			return true
 		end
@@ -581,19 +591,16 @@ update_messages = function(data)
 	-- I had a decent version of preventing exceeding 500 chars when showing multiple signals, but ran into the fact that the line cutoff still breaks color/font
 	-- so it's pointless to do, I now let the game itself cutoff get_all_signals_text()
 	
-	-- don't update while gui is open, via check so we avoid having to mess with buckets which can cause rebuilds
-	if storage.opened_guis[display.unit_number] then
-		return -- don't touch!
-	end
-	
-	-- skip double updates for alt/chart overlaps, or alt + hovered as it is cheap compared to actual update
-	local tick = game.tick
-	if game.tick == data.last_updated then
+	if not display.valid then
 		return
 	end
-	data.last_updated = tick
 	
-	if DEBUG then _dbg_disp(data.entity, {.2,1,.2}) end
+	-- don't update while gui is open, via check so we avoid having to mess with chunks which can cause rebuilds
+	if storage.opened_guis[display.unit_number] then
+		return
+	end
+	
+	if DEBUG then _dbg_display(data.entity, {.2,1,.2}) end
 	
 	-- cache in case multiple messages exist
 	local all_signals = nil
@@ -603,13 +610,14 @@ update_messages = function(data)
 	
 	local ctrl = data.ctrl
 	local cached = data.message_cache
+	if not ctrl then return end -- let's be safe
 	
 	for i,m in ipairs(ctrl.messages) do
 		local icon = m.icon
 		local text = m.text
 		local cached_msg = cached[i]
 		
-		if text and icon.name and cached_msg then
+		if text and icon and icon.name and cached_msg then
 			local name = icon.name
 			if icon.type == "virtual" then
 				if name == "signal-each" then
@@ -713,21 +721,21 @@ local function rebuild_drawlists()
 		
 		-- TODO: optimize via on_player_toggled_alt_mode + ?
 		-- sadly chart mode does not seem to have en event? poll that one infrequently?
-		local surf = storage.buckets[player.surface_index]
+		local surf = storage.chunks[player.surface_index]
 		if surf then
 			if chart then -- game view or char_zoomed_in render actual entities, chart is map mode
-				local bucket = surf[CHART_KEY]
-				if bucket then
-					draw_lists[bucket] = true
+				local chunk = surf.chart
+				if chunk then
+					draw_lists[chunk] = true
 				end
 			elseif alt then
 				pl.alt_mode = true
 				for y=y0,y1 do
 					for x=x0,x1 do
 						local key = chunk_key(x,y)
-						local bucket = surf[key]
-						if bucket then
-							draw_lists[bucket] = true
+						local chunk = surf[key]
+						if chunk then
+							draw_lists[chunk] = true
 						end
 					end
 				end
@@ -739,13 +747,13 @@ local function rebuild_drawlists()
 	
 	if DEBUG then
 		local _total = 0
-		for bucket, _ in pairs(draw_lists) do
-			_total = _total + #bucket.draw_list
+		for chunk, _ in pairs(draw_lists) do
+			_total = _total + #chunk.draw_list
 			
-			--if not storage.draw_lists[bucket] then _dbg_bucket(bucket, {1,.2,1}, 60) end
+			--if not storage.draw_lists[chunk] then _dbg_chunk(chunk, {1,.2,1}, 60) end
 		end
 		
-		game.print(string.format("rebuild_drawlists: at %d: buckets: %d displays: %d", game.tick, table_size(draw_lists), _total))
+		game.print(string.format("rebuild_drawlists: at %d: chunks: %d displays: %d", game.tick, table_size(draw_lists), _total))
 	end
 	
 	storage.draw_lists = draw_lists
@@ -860,40 +868,43 @@ local function optimized_message_update()
 	local tick = game.tick
 	local last_tick = tick-1
 	
-	for bucket, _ in pairs(draw_lists) do
-		local last_updated = bucket.last_updated
-		bucket.last_updated = tick
-		local list = bucket.draw_list
+	-- TODO: draw draw list with CD, then poll using chunking as well
+	
+	for chunk, _ in pairs(draw_lists) do
+		local list = chunk.draw_list
 		
-		if DEBUG then _dbg_bucket(bucket, {1,.2,.2}) end
+		if DEBUG then _dbg_chunk(chunk, {1,.2,.2}) end
 		
-		if last_updated == last_tick then
-			-- fastpath, do circuit change detection
-			for i=1,#list do
-				local data = list[i]
-				-- This change detection only works if we also updated this display last tick!
-				local r = data.acR
-				local g = data.acG
-				if (r and r.get_signals(CR, CG)) or (g and g.get_signals(CR, CG)) then
-					update_messages(data)
-				end
-			end
-		else
-			-- slowpath, chunk was not observed last tick
-			-- Happens due to chunk getting created or newly observed due to
-			-- alt mode toggle, enter/exit chart mode, surface switch, new player, player moved or zoomed etc.
-			-- change detect ACs not valid since we may have missed changes!
-			for i=1,#list do
-				local data = list[i]
+		for i=1,#list do
+			local data = list[i]
+			-- This change detection only works if we also updated this display last tick!
+			local r = data.acR
+			local g = data.acG
+			if (r and r.get_signals(CR, CG)) ~= nil or (g and g.get_signals(CR, CG)) ~= nil or data.last_updated ~= last_tick then
 				update_messages(data)
+			else
+				_dbg_box(data.entity.position, {x=0.95, y=0.95}, data.sid, {1,0.1,0.7,0.1})
 			end
+			
+			if i==2 then
+				game.print(serpent.line{i,
+					R1=r and r.get_signals(CR), R2=r and r.get_signals(CG),
+					G1=g and g.get_signals(CR), G2=g and g.get_signals(CG)}, PRNT)
+			end
+			
+			data.last_updated = tick
 		end
 	end
 end
 
 if DEBUG then
 	local p, p2
+	local _reset2
 	script.on_event(defines.events.on_tick, function(event)
+		if not p then
+			_reset2()
+		end
+		
 		p = p or game.create_profiler(true)
 		p2 = p2 or game.create_profiler(true)
 
@@ -908,7 +919,7 @@ if DEBUG then
 		if event.tick % 60 == 0 then
 			p.divide(60)
 			p2.divide(60)
-			game.print({"", "on_tick: ", p, "\n", p2})
+			game.print({"", "on_tick: ", p, "\n", p2}, PRNT)
 			p.reset()
 			p2.reset()
 		end
@@ -979,7 +990,7 @@ script.on_event(defines.events.on_gui_opened, function(event)
 		if data then
 			storage.opened_guis[entity.unit_number] = data
 			
-			--used to call reset_display but it's better to not touch buckets for efficiency, simply skip update in update_messages instead
+			--used to call reset_display but it's better to not touch chunks for efficiency, simply skip update in update_messages instead
 			-- just reset messages for cleaner user edits
 			reset_messages(data)
 		end
@@ -1032,9 +1043,11 @@ script.on_event(defines.events.on_entity_settings_pasted, on_entity_event) -- so
 -- don't react to circuit wire add/remove as there are no events (perel is great but does not handle blueprint-over and undo/redo)
 -- don't react to blueprinting as it already mostly works, and blueprinting over is very complex (but blueprint lib is nice)
 
+-- TODO: maybe consider reacting to wire changes after all?
+
 local deathrattles = {} ---@type function(EventData.on_object_destroyed)[]
 deathrattles[defines.target_type.surface] = function(event)
-	storage.buckets[event.useful_id] = nil
+	storage.chunks[event.useful_id] = nil
 	rebuild_drawlists()
 end
 deathrattles[defines.target_type.player] = function(event)
@@ -1061,7 +1074,7 @@ local function init()
 	storage.poll_list = {}
 	storage.poll_idx = {}
 	storage.poll_cur = 1
-	storage.buckets = {}
+	storage.chunks = {}
 	storage.draw_lists = {}
 	storage.players = {}
 	storage.opened_guis = {}
@@ -1090,121 +1103,52 @@ script.on_configuration_changed(function(data)
 	_reset()
 end)
 
--- removed to not clutter up /help
-commands.add_command("hexcoder-signal-display-reset", nil, function(command)
-	_reset()
-end)
-
---[[
-commands.add_command("profile1", nil, function(command)
-	local N = 10000000
+if DEBUG then
+	_reset2 = _reset
 	
-	local s_tbl = { s1=1, s2=2, s3=3, s4=4, s5=5, s6=6, s7=7, s8=8, s9=9, s10=10 }
+	-- don't clutter up /help
+	commands.add_command("hexcoder-signal-display-reset", nil, function(command)
+		_reset()
+	end)
 	
-	local short =     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	local long =      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabb"
-	local very_long = "long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_"
-	s_tbl[short] = 11
-	s_tbl[long] = 12
-	s_tbl[very_long] = 13
-	
-	local short2 =     string.format("%saaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "a")
-	local long2 =      string.format("%saaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabb", "a")
-	local very_long2 = string.format("%s_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_long_string_",
-		"long")
-	
-	local a_tbl = {}; for i = 1, 10 do a_tbl[i] = i end
-	local f_tbl = {}; for i = 1, 10 do f_tbl[i + 0.5] = i end
-	
-	local ps = game.create_profiler(); for i = 1, N do
-		local _ = s_tbl.s3
-		local _ = s_tbl.s6
-		local _ = s_tbl.s9
-	end; ps.stop()
-	
-	local ps2 = game.create_profiler(); for i = 1, N do
-		local _ = s_tbl["s3"]
-		local _ = s_tbl["s6"]
-		local _ = s_tbl["s9"]
-	end; ps2.stop()
-	
-	local ps3 = game.create_profiler(); for i = 1, N do
-		local _ = s_tbl[short2]
-		local _ = s_tbl[short2]
-		local _ = s_tbl[short2]
-	end; ps3.stop()
-	
-	local ps4 = game.create_profiler(); for i = 1, N do
-		local _ = s_tbl[long2]
-		local _ = s_tbl[long2]
-		local _ = s_tbl[long2]
-	end; ps4.stop()
-	
-	local ps5 = game.create_profiler(); for i = 1, N do
-		local _ = s_tbl[very_long2]
-		local _ = s_tbl[very_long2]
-		local _ = s_tbl[very_long2]
-	end; ps5.stop()
-	
-	local pa = game.create_profiler(); for i = 1, N do
-		local _ = a_tbl[3]
-		local _ = a_tbl[6]
-		local _ = a_tbl[9]
-	end; pa.stop()
-	
-	local pf = game.create_profiler(); for i = 1, N do 
-		local _ = f_tbl[3.5]
-		local _ = f_tbl[6.5]
-		local _ = f_tbl[9.5]
-	end; pf.stop()
-	
-	game.player.print({ "", "  string_key=", ps,
-		"\nstring_key[str]=", ps2,
-		"\nstring_key[short]=", ps3, 
-		"\nstring_key[long]=", ps4, 
-		"\nstring_key[very_long]=", ps5, 
-		"\narray_index=", pa,
-		"\nfloat_key=", pf })
-end)]]
-
-commands.add_command("profile1", nil, function(command)
-	local list = storage.poll_list
-	local p = game.create_profiler()
-	for i=1,#list do
-		local data = list[i]
-		local e = data.entity
-		-- .valid check is supposedly needed even with on_object_destroyed
-		-- check nil as well just to be safe
-		if e and e.valid then
-			if display_was_modified(data, e) then
-				update_display(e)
+	commands.add_command("profile1", nil, function(command)
+		local list = storage.poll_list
+		local p = game.create_profiler()
+		for i=1,#list do
+			local data = list[i]
+			local e = data.entity
+			-- .valid check is supposedly needed even with on_object_destroyed
+			-- check nil as well just to be safe
+			if e and e.valid then
+				if display_was_modified(data, e) then
+					update_display(e)
+				end
 			end
 		end
-	end
-	p.stop()
-	
-	game.player.print({ "", "  poll_total=", p })
-	p.divide(#list)
-	game.player.print({ "", "  avg=", p })
-end)
+		p.stop()
+		
+		game.player.print({ "", "  poll_total=", p }, PRNT)
+		p.divide(#list)
+		game.player.print({ "", "  avg=", p }, PRNT)
+	end)
+end
 
 ---@class player_index : integer
 ---@class surface_index : integer
 ---@class unit_number : integer
----@class bucket_key : number -- double
+---@alias chunk_key number|"chart"
 ---@class tick_num : integer
 
 ---@class DisplayEntity : LuaEntity
 
 ---@class ModStorage
 ---@field all_displays table<unit_number, Display>
----@field poll_list Display[]
----@field poll_idx table<Display, integer>
----@field poll_cur integer
----@field buckets table<surface_index, SurfaceBuckets>
----@field draw_lists table<Bucket, boolean>
+---@field chunks table<surface_index, SurfaceData>
+---@field draw_lists table<Chunk, boolean>
 ---@field players table<player_index, Player>
 ---@field opened_guis table<unit_number, Display>
+---@field poll_cur_list integer
+---@field poll_cur integer
 ---@field need_rebuild boolean
 
 ---@class Display
@@ -1212,13 +1156,13 @@ end)
 ---@field acR? LuaEntity
 ---@field acG? LuaEntity
 ---@field sid integer
----@field chunk_key bucket_key
+---@field chunk_key chunk_key
 ---@field last_updated tick_num?
 ---@field ctrl LuaDisplayPanelControlBehavior
 ---@field connR LuaWireConnector
 ---@field connG LuaWireConnector
----@field chart Bucket?
----@field alt Bucket?
+---@field chart Chunk?
+---@field alt Chunk?
 ---@field message_cache table<integer, Message>
 
 ---@class Message
@@ -1229,16 +1173,16 @@ end)
 ---@field formQ? string
 ---@field div? number
 
----@class SurfaceBuckets
----@field _surfID surface_index
----@field [bucket_key] Bucket
+---@class SurfaceData
+---@field sid surface_index
+---@field [chunk_key] Chunk
+---@field chart_displays DisplayList
 
----@class Bucket
----@field last_updated tick_num?
----@field draw_list Display[]
----@field indexes table<Display, bucket_key> -- draw list index map
----@field surfID surface_index
----@field chunk_key bucket_key
+---@class Chunk
+---@field draw_list DisplayList
+---@field all_displays DisplayList
+---@field sid surface_index
+---@field chunk_key chunk_key
 
 ---@class Player
 ---@field render_mode defines.render_mode
