@@ -1056,6 +1056,9 @@ script.on_event(defines.events.on_runtime_mod_setting_changed, function(event)
 end)
 
 local function init()
+	-- only init if storage empty
+	if next(storage) then return end
+	
 	storage = {}
 	storage.all_displays = {}
 	storage.poll_list = {}
@@ -1082,11 +1085,19 @@ local function _reset()
 		end
 	end
 	
+	-- clear storage and re-init
+	storage = {}
 	init()
 end
+script.on_init(function(event)
+	init()
+end)
 script.on_configuration_changed(function(data)
 	local changes = data.mod_changes["hexcoder-signal-display"]
 	if not changes then return end
+	
+	-- can just reset since we don't actually store user settings in entity engine data
+	-- TODO: don't init twice on fresh save?
 	_reset()
 end)
 
