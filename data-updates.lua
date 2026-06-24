@@ -1,5 +1,5 @@
 mod_name = "hexcoder-signal-display-"
-local dbg = false
+local dbg = settings.startup[mod_name.."debug"].value
 
 local function make_phantom(thing)
 	thing.flags = {"not-on-map",

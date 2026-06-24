@@ -1,3 +1,6 @@
+mod_name = "hexcoder-signal-display-"
+local dbg = settings.startup[mod_name.."debug"].value
+
 ---@type ModStorage
 storage = storage
 
@@ -17,8 +20,8 @@ storage = storage
 ---@field alt DisplayData[]
 
 local W = defines.wire_connector_id
-local HIDDEN = defines.wire_origin.script
---local HIDDEN = defines.wire_origin.player
+-- Make wires hidden or visible depending on dbg mode (is this needed if combinators are hidden already?, maybe still a good idea to have wires count as 'script')
+local HIDDEN = dbg and defines.wire_origin.player or defines.wire_origin.script
 local CR = defines.wire_connector_id.circuit_red
 local CG = defines.wire_connector_id.circuit_green
 
@@ -47,6 +50,8 @@ local AC_NEGATE_EACH_G = { ---@type ArithmeticCombinatorParameters
 	output_signal={type="virtual", name="signal-each"}
 }
 
+-- 2.1 introduced LuaControlBehavior.input_networks but it seems that display panels don't actually give this option to the player so we can ignore it in our code
+
 ---@param display LuaEntity
 ---@returns boolean
 local function should_update(display)
@@ -63,7 +68,7 @@ local function should_update(display)
 	                  display.get_circuit_network(W.circuit_green) ~= nil
 	local ctrl = connected and display.get_control_behavior() or nil --[[@as LuaDisplayPanelControlBehavior]]
 	if ctrl then
-		for _,m in ipairs(ctrl.messages) do
+		for _,m in ipairs(ctrl.records) do
 			if m.icon and m.text and m.text:find("{[^{}]*}") then
 				return true
 			end
@@ -74,10 +79,10 @@ end
 
 ---@param ctrl LuaDisplayPanelControlBehavior
 local function reset_messages(ctrl)
-	for i,m in ipairs(ctrl.messages) do
+	for i,m in ipairs(ctrl.records) do
 		if m.text then
 			m.text = m.text:gsub("{[^{}]*}", "{}")
-			ctrl.set_message(i, m)
+			ctrl.set_record(i, m)
 		end
 	end
 end
@@ -109,6 +114,9 @@ local function reset_display(id)
 end
 
 -- start or stop updating display depending on if any messages contain format trigger {}
+-- and insert or remove from update lists
+-- this should be called any time a setting on the display has changed, but due to lack of events for lots of things like undo/redo, blueprinting
+-- we are sometimes not calling this, this needs to be fixed either with polling or simply by the player opening the display gui once
 ---@param display LuaEntity
 local function check_display(display)
 	local id = display.unit_number ---@cast id -nil
@@ -172,7 +180,7 @@ local function _comp_signal(l, r)
 	return l.count > r.count
 end
 
-local dbg = true
+-- draw X over display when it updates
 local function _dbg_update(display)
 	local pos = display.position
 	
@@ -201,7 +209,7 @@ local function update_messages(display)
 	-- I had a decent version of preventing exceeding 500 chars when showing multiple signals, but ran into the fact that the line cutoff still breaks color/font
 	-- so it's pointless to do, I now let the game itself cutoff get_all_signals_text()
 	
-	--if dbg then _dbg_update(display) end
+	if dbg then _dbg_update(display) end
 	
 	-- cache in case multiple messages exist
 	local all_signals = nil
@@ -296,7 +304,7 @@ local function update_messages(display)
 	
 	local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
 	if ctrl then
-		for i,m in ipairs(ctrl.messages) do
+		for i,m in ipairs(ctrl.records) do
 			local icon = m.icon
 			local text = m.text
 			
@@ -318,7 +326,7 @@ local function update_messages(display)
 				end
 				
 				m.text = text
-				ctrl.set_message(i, m)
+				ctrl.set_record(i, m)
 				
 				--ctrl.set_message(i, {
 				--	icon = icon,
@@ -364,7 +372,7 @@ local function optimized_update(event)
 		::continue::
 	end
 	
-	-- if update list was not updates last tick, bypass change detection
+	-- if update list was not updated last tick, bypass change detection
 	local updated_last_tick = storage.updated_last_tick
 	
 	for update_list, _ in pairs(update_lists) do
@@ -404,13 +412,13 @@ end
 local function tick_gui(display)
 	local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
 	if ctrl then
-		for i,m in ipairs(ctrl.messages) do
+		for i,m in ipairs(ctrl.records) do
 			if m.icon and m.icon.type == "virtual" then
 				-- convenience feature: its annoying that when connecting circuit to display panel by default it shows nothing
 				if m.text == nil and m.condition == nil then
 					m.text = "{}"
 					m.condition = ANY_SIGNAL_COND
-					ctrl.set_message(i,m)
+					ctrl.set_record(i,m)
 				end
 			end
 		end
@@ -493,7 +501,7 @@ local function _reset()
 	
 	for _, s in pairs(game.surfaces) do
 		for _, name in pairs({"hidden-change-detector"}) do
-			for _, e in pairs(s.find_entities_filtered{ name="hexcoder-signal-display-"..name }) do
+			for _, e in pairs(s.find_entities_filtered{ name=mod_name..name }) do
 				e.destroy()
 			end
 		end
@@ -515,22 +523,22 @@ end)
 --end)
 
 -- removed to not clutter up /help
-commands.add_command("hexcoder-signal-display-reset", nil, function(command)
-	_reset()
-end)
-
-commands.add_command("hexcoder-signal-display-migrate", nil, function(command)
-	for _, surface in pairs(game.surfaces) do
-		for _, display in ipairs(surface.find_entities_filtered{ type="display-panel" }) do
-			local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior]]
-			for i,m in ipairs(ctrl.messages) do
-				--m.text:gsub("(%[[%w-]+=[%w-]+%] [%d.]+[ ]?)+", "{}")
-				m.text:gsub("%[[^%[%]]%]", "{}")
-				m.text:gsub("[%d.]+", "{}")
-				ctrl.set_message(i, m)
-			end
-		end
-	end
-	
-	_reset()
-end)
+--commands.add_command("hexcoder-signal-display-reset", nil, function(command)
+--	_reset()
+--end)
+--
+--commands.add_command("hexcoder-signal-display-migrate", nil, function(command)
+--	for _, surface in pairs(game.surfaces) do
+--		for _, display in ipairs(surface.find_entities_filtered{ type="display-panel" }) do
+--			local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior]]
+--			for i,m in ipairs(ctrl.records) do
+--				--m.text:gsub("(%[[%w-]+=[%w-]+%] [%d.]+[ ]?)+", "{}")
+--				m.text:gsub("%[[^%[%]]%]", "{}")
+--				m.text:gsub("[%d.]+", "{}")
+--				ctrl.set_record(i, m)
+--			end
+--		end
+--	end
+--	
+--	_reset()
+--end)

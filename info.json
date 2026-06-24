@@ -1,11 +1,11 @@
 {
 	"name": "hexcoder-signal-display",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"title": "Easy Signal Display",
 	"author": "Hexcoder",
-	"factorio_version": "2.0",
+	"factorio_version": "2.1",
 	"dependencies": [
-		"base >= 2.0.61"
+		"base >= 2.1.7"
 	],
 	"description": "Easy to use multi or single signal display, useful for messing with circuits\nOkay-ish performance\nUse formats like /1000f2 for fixed point\nEach signal shows all signals"
 }
