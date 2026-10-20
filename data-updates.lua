@@ -1,4 +1,4 @@
-mod_name = "hexcoder-signal-display-"
+local mod_name = "hexcoder-signal-display-"
 local dbg = settings.startup[mod_name.."debug"].value
 
 local function make_phantom(thing)
@@ -21,9 +21,9 @@ local function make_phantom(thing)
 	thing.close_sound = nil
 	thing.impact_category = nil
 	
-	if dbg then
-		thing.selection_priority = 100
-	else
+	--if dbg then
+	--	thing.selection_priority = 100
+	--else
 		table.insert(thing.flags, "hide-alt-info")
 		
 		thing.picture = nil
@@ -56,7 +56,7 @@ local function make_phantom(thing)
 		thing.and_symbol_sprites = nil
 		thing.or_symbol_sprites = nil
 		thing.xor_symbol_sprites = nil
-	end
+	--end
 end
 
 local ac = util.table.deepcopy(data.raw["arithmetic-combinator"]["arithmetic-combinator"])

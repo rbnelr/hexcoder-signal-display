@@ -1,4 +1,4 @@
-mod_name = "hexcoder-signal-display-"
+local mod_name = "hexcoder-signal-display-"
 data:extend({
 	{
 		type = "bool-setting",

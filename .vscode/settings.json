@@ -1,0 +1,20 @@
+{
+	"factorio.versions": [
+		{
+			"name": "drm_free",
+			"factorioPath": "c:\\factorio_drm_free\\bin\\x64\\factorio.exe"
+		},
+		{
+			"name": "steam",
+			"factorioPath": "c:\\steam_ssd\\steamapps\\common\\Factorio\\bin\\x64\\factorio.exe"
+		},
+		{
+			"name": "2.0",
+			"factorioPath": "c:\\factorio_drm_free\\Factorio_2.0\\bin\\x64\\factorio.exe"
+		}
+	],
+	"Lua.workspace.userThirdParty": [
+		"c:\\Users\\Me\\AppData\\Roaming\\Code\\User\\workspaceStorage\\4d43de8fe1231918ce507ddc8e3f329f\\justarandomgeek.factoriomod-debug\\sumneko-3rd"
+	],
+	"Lua.workspace.checkThirdParty": "ApplyInMemory"
+}
