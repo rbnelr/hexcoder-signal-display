@@ -4,6 +4,10 @@ local DEBUG = true
 ---@type ModStorage
 storage = storage
 
+local CR = defines.wire_connector_id.circuit_red
+local CG = defines.wire_connector_id.circuit_green
+local ANY_SIGNAL_COND = { first_signal={type="virtual", name="signal-anything"}, constant=0, comparator="≠" }
+
 ---@class unit_number integer
 ---@class surface_index integer
 
@@ -12,21 +16,18 @@ storage = storage
 ---@field last_polled unit_number?
 ---@field surfaces table<surface_index, SurfUpdateLists>
 ---@field extra_update table<DisplayData, true>
----@field updated_last_tick table<LuaEntity[], true>
 ---@field opened_guis table<unit_number, true>
 
 ---@class DisplayData
 ---@field entity LuaEntity
 ---@field sid surface_index -- surface index, needed to remove display from correct SurfUpdateLists after entity is no longer valid, maybe could be removed lazily?
----@field update_tick integer
+---@field change_tick integer? -- tick of last change
+---@field wire1? defines.wire_connector_id
+---@field wire2? defines.wire_connector_id
 
 ---@class SurfUpdateLists
 ---@field chart DisplayData[]
 ---@field alt DisplayData[]
-
-local CR = defines.wire_connector_id.circuit_red
-local CG = defines.wire_connector_id.circuit_green
-local ANY_SIGNAL_COND = { first_signal={type="virtual", name="signal-anything"}, constant=0, comparator="≠" }
 
 -- example tich text:
 -- [virtual-signal=signal-deny] [entity=big-biter]  [virtual-signal=signal-B]
@@ -46,7 +47,7 @@ local SIGNAL2RICH_TEXT = {
 -- 2.1 introduced LuaControlBehavior.input_networks but it seems that display panels don't actually give this option to the player so we can ignore it in our code
 
 ---@param display LuaEntity
----@returns boolean
+---@returns boolean, defines.wire_connector_id?, defines.wire_connector_id?
 local function should_update(display)
 	-- only actually needed in multiplayer, might be overkill
 	for _, player in pairs(game.connected_players) do
@@ -57,13 +58,16 @@ local function should_update(display)
 	end
 	
 	-- Need to reject unconnected displays or we might inexplicably overwrite user typed message
-	local connected = display.get_circuit_network(CR) ~= nil or
-	                  display.get_circuit_network(CG) ~= nil
-	local ctrl = connected and display.get_control_behavior() or nil --[[@as LuaDisplayPanelControlBehavior]]
+	local connR = display.get_circuit_network(CR) and CR
+	local connG = display.get_circuit_network(CG) and CG
+	local wire1 = connR or connG
+	local wire2 = connG
+	
+	local ctrl = wire1 and display.get_control_behavior() or nil --[[@as LuaDisplayPanelControlBehavior]]
 	if ctrl then
 		for _,m in ipairs(ctrl.records) do
 			if m.icon and m.text and m.text:find("{[^{}]*}") then
-				return true
+				return true, wire1, wire2
 			end
 		end
 	end
@@ -90,6 +94,9 @@ local function reset_display(id)
 			reset_messages(ctrl)
 		end
 		
+		data.wire1 = nil
+		data.wire2 = nil
+		
 		local surf = storage.surfaces[data.sid]
 		if surf then
 			surf.chart[id] = nil
@@ -115,12 +122,14 @@ local function check_display(display)
 		data = {
 			entity = display,
 			sid = display.surface_index --[[@as surface_index]],
-			update_tick = -1, -- force update
+			update_tick = 0, -- force update
 		}
 		storage.all_displays[id] = data
 	end
 	
-	if should_update(display) then
+	local update
+	update, data.wire1, data.wire2 = should_update(display)
+	if update then
 		
 		-- update update lists
 		local surf = storage.surfaces[data.sid] or { chart={}, alt={} }
@@ -132,11 +141,11 @@ local function check_display(display)
 		
 		-- updated_last_tick optimization might not be valid for this display
 		storage.extra_update[data] = true
+		
+		data.update_tick = 0 -- force update
 	else
 		reset_display(id)
 	end
-	
-	data.update_tick = -1 -- force update
 end
 
 ---@param id unit_number
@@ -221,8 +230,8 @@ local function get_all_signals_text(input, all_signals)
 	return input:gsub("{[^{}]*}", text.." }", 1)
 end
 
----@param display LuaEntity
-local function update_messages(display)
+---@param data DisplayData
+local function update_messages(data)
 	-- display.display_panel_text and display.display_panel_icon
 	-- are essentially variables that the player can config if the display is not connect to circuits
 	-- when the display is connected to circuits they can configure circuit conditions
@@ -238,6 +247,8 @@ local function update_messages(display)
 	-- Here I avoid using color/font for more than one number
 	-- I had a decent version of preventing exceeding 500 chars when showing multiple signals, but ran into the fact that the line cutoff still breaks color/font
 	-- so it's pointless to do, I now let the game itself cutoff get_all_signals_text()
+	
+	local display = data.entity
 	
 	-- sigh, on_object_destroyed is not reliable
 	if not display.valid then
@@ -309,10 +320,10 @@ local function poll_displays()
 	end
 	storage.last_polled = id
 end
-local function optimized_message_update()
+---@param event EventData.on_tick
+local function optimized_message_update(event)
 	-- early out if no displays are placed
 	if next(storage.all_displays) == nil then
-		storage.updated_last_tick = storage.updated_last_tick or {}
 		storage.extra_update = storage.extra_update or {}
 		return
 	end
@@ -320,6 +331,7 @@ local function optimized_message_update()
 	-- collect lists of per-surface chart and alt lists that are observed
 	-- plus lists of any displays that are not in chart or alt but are hovered
 	-- use 'update_lists[table] = true' to deduplicate
+	---@type table<DisplayData[], true>
 	local update_lists = {}
 	local extra_update = storage.extra_update
 	for _, player in pairs(game.connected_players) do
@@ -339,38 +351,28 @@ local function optimized_message_update()
 		end
 	end
 	
-	-- if update list was not updated last tick, bypass change detection
-	local updated_last_tick = storage.updated_last_tick
-	
+	local cur_tick = event.tick
 	for update_list, _ in pairs(update_lists) do
-		if updated_last_tick[update_list] == nil then
-			-- change detect ACs not valid since not read last tick
-			for _, data in pairs(update_list) do
-				update_messages(data.entity)
-				extra_update[data] = nil
-			end
-		else
-			for _, data in pairs(update_list) do
-				-- Cool optimization: edge detector AC, read combined inputs (current + negated_previous tick signals) if get_signals()=nil, then no change
-				-- Need 2 to catch red and green wires (could usually avoid get_signals if wire connect/disconnect was an event, but unclear how slow 1 API call actually is vs the extra check in lua
-				-- This change detection only works if we also updated this display last tick!
-				local e = data.entity
-				if e.get_signals_changed(CR) or
-				   e.get_signals_changed(CG) then
-					update_messages(data.entity)
-					extra_update[data] = nil
-				end
+		for _, data in pairs(update_list) do
+			local e = data.entity
+			local change_tick = data.change_tick
+			local wire2 = data.wire2
+			if e.get_signals_changed(data.wire1, change_tick) or
+			   (wire2 and e.get_signals_changed(wire2, change_tick)) then
+				update_messages(data)
+				data.change_tick = cur_tick
 			end
 		end
 	end
 	
-	-- handle hovered displays and displays that were modified/added potentially breaking change detect
-	-- (don't add observed checks as this is rare)
+	-- handle hovered displays
 	for data, _ in pairs(extra_update) do
-		update_messages(data.entity)
+		if cur_tick ~= data.change_tick then
+			update_messages(data)
+			data.change_tick = cur_tick
+		end
 	end
 	
-	storage.updated_last_tick = update_lists
 	storage.extra_update = {}
 end
 
@@ -395,7 +397,7 @@ script.on_event(defines.events.on_tick, optimized_message_update)
 --	p2 = p2 or helpers.create_profiler(true)
 --	
 --	p2.restart()
---	optimized_message_update()
+--	optimized_message_update(event.tick)
 --	p2.stop()
 --	
 --	if event.tick % 60 == 0 then
