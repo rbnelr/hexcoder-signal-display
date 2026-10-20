@@ -1,5 +1,5 @@
 local mod_name = "hexcoder-signal-display-"
-local dbg = settings.startup[mod_name.."debug"].value
+local DEBUG = true
 
 ---@type ModStorage
 storage = storage
@@ -18,17 +18,15 @@ storage = storage
 ---@class DisplayData
 ---@field entity LuaEntity
 ---@field sid surface_index -- surface index, needed to remove display from correct SurfUpdateLists after entity is no longer valid, maybe could be removed lazily?
----@field acs? LuaEntity[]
+---@field update_tick integer
 
 ---@class SurfUpdateLists
 ---@field chart DisplayData[]
 ---@field alt DisplayData[]
 
-local W = defines.wire_connector_id
 local CR = defines.wire_connector_id.circuit_red
 local CG = defines.wire_connector_id.circuit_green
--- Make wires hidden or visible depending on dbg mode (is this needed if combinators are hidden already?, maybe still a good idea to have wires count as 'script')
-local HIDDEN = dbg and defines.wire_origin.player or defines.wire_origin.script
+local ANY_SIGNAL_COND = { first_signal={type="virtual", name="signal-anything"}, constant=0, comparator="≠" }
 
 -- example tich text:
 -- [virtual-signal=signal-deny] [entity=big-biter]  [virtual-signal=signal-B]
@@ -43,16 +41,6 @@ local SIGNAL2RICH_TEXT = {
 	["space-location"]="planet",
 	["asteroid-chunk"]="item",
 	["quality"]="quality"
-}
-local ANY_SIGNAL_COND = { first_signal={type="virtual", name="signal-anything"}, constant=0, comparator="≠" }
-
-local AC_NEGATE_EACH_R = { ---@type ArithmeticCombinatorParameters
-	first_signal={type="virtual", name="signal-each"}, second_constant=-1, operation="*", first_signal_networks={green=false},
-	output_signal={type="virtual", name="signal-each"}
-}
-local AC_NEGATE_EACH_G = { ---@type ArithmeticCombinatorParameters
-	first_signal={type="virtual", name="signal-each"}, second_constant=-1, operation="*", first_signal_networks={red=false},
-	output_signal={type="virtual", name="signal-each"}
 }
 
 -- 2.1 introduced LuaControlBehavior.input_networks but it seems that display panels don't actually give this option to the player so we can ignore it in our code
@@ -69,11 +57,11 @@ local function should_update(display)
 	end
 	
 	-- Need to reject unconnected displays or we might inexplicably overwrite user typed message
-	local connected = display.get_circuit_network(W.circuit_red) ~= nil or
-	                  display.get_circuit_network(W.circuit_green) ~= nil
+	local connected = display.get_circuit_network(CR) ~= nil or
+	                  display.get_circuit_network(CG) ~= nil
 	local ctrl = connected and display.get_control_behavior() or nil --[[@as LuaDisplayPanelControlBehavior]]
 	if ctrl then
-		for _,m in ipairs(ctrl.messages) do
+		for _,m in ipairs(ctrl.records) do
 			if m.icon and m.text and m.text:find("{[^{}]*}") then
 				return true
 			end
@@ -84,10 +72,10 @@ end
 
 ---@param ctrl LuaDisplayPanelControlBehavior
 local function reset_messages(ctrl)
-	for i,m in ipairs(ctrl.messages) do
+	for i,m in ipairs(ctrl.records) do
 		if m.text then
 			m.text = m.text:gsub("{[^{}]*}", "{}")
-			ctrl.set_message(i, m)
+			ctrl.set_record(i, m)
 		end
 	end
 end
@@ -100,14 +88,6 @@ local function reset_display(id)
 		local ctrl = data.entity and data.entity.valid and data.entity.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior]]
 		if ctrl then
 			reset_messages(ctrl)
-		end
-		
-		-- Delete the change detectors every time gui is opened, seems brittle but has worked well, so keep it
-		if data.acs then
-			for _,ac in pairs(data.acs) do
-				ac.destroy()
-			end
-			data.acs = nil
 		end
 		
 		local surf = storage.surfaces[data.sid]
@@ -135,42 +115,12 @@ local function check_display(display)
 		data = {
 			entity = display,
 			sid = display.surface_index --[[@as surface_index]],
+			update_tick = -1, -- force update
 		}
 		storage.all_displays[id] = data
 	end
 	
 	if should_update(display) then
-		
-		local function make_combinator(x,y, params, detect_wire)
-			local ac = display.surface.create_entity{
-				name="hexcoder-signal-display-hidden-change-detector", force=display.force,
-				position={display.position.x+x, display.position.y+y}, snap_to_grid=false,
-				direction=defines.direction.north
-			} ---@cast ac -nil
-			ac.destructible = false
-			
-			local ctrl = ac.get_or_create_control_behavior() --[[@as LuaArithmeticCombinatorControlBehavior]]
-			ctrl.parameters = params
-			
-			local conn = ac.get_wire_connectors(true)
-			local d = display.get_wire_connectors(true)
-			
-			if detect_wire == W.circuit_red then
-				conn[W.combinator_input_red  ].connect_to(d[detect_wire], false, HIDDEN)
-				conn[W.combinator_input_green].connect_to(conn[W.combinator_output_green], false, HIDDEN)
-			else
-				conn[W.combinator_input_red  ].connect_to(conn[W.combinator_output_red], false, HIDDEN)
-				conn[W.combinator_input_green].connect_to(d[detect_wire], false, HIDDEN)
-			end
-			return ac
-		end
-		
-		if data.acs == nil then
-			data.acs = {
-				make_combinator(-0.4, -1.5, AC_NEGATE_EACH_R, W.circuit_red),
-				make_combinator(0.4, -1.5, AC_NEGATE_EACH_G, W.circuit_green),
-			}
-		end
 		
 		-- update update lists
 		local surf = storage.surfaces[data.sid] or { chart={}, alt={} }
@@ -185,6 +135,8 @@ local function check_display(display)
 	else
 		reset_display(id)
 	end
+	
+	data.update_tick = -1 -- force update
 end
 
 ---@param id unit_number
@@ -297,14 +249,14 @@ local function update_messages(display)
 		return
 	end
 	
-	if dbg then _dbg_update(display) end
+	if DEBUG then _dbg_update(display) end
 	
 	-- cache in case multiple messages exist
 	local all_signals = nil
 	
 	local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
 	if ctrl then
-		for i,m in ipairs(ctrl.messages) do
+		for i,m in ipairs(ctrl.records) do
 			local icon = m.icon
 			local text = m.text
 			
@@ -342,7 +294,7 @@ local function update_messages(display)
 				end
 				
 				m.text = text
-				ctrl.set_message(i, m)
+				ctrl.set_record(i, m)
 			end
 		end
 	end
@@ -402,10 +354,9 @@ local function optimized_message_update()
 				-- Cool optimization: edge detector AC, read combined inputs (current + negated_previous tick signals) if get_signals()=nil, then no change
 				-- Need 2 to catch red and green wires (could usually avoid get_signals if wire connect/disconnect was an event, but unclear how slow 1 API call actually is vs the extra check in lua
 				-- This change detection only works if we also updated this display last tick!
-				local acA = data.acs[1]
-				local acB = data.acs[2]
-				if acA.get_signals(CR, CG) ~= nil or
-				   acB.get_signals(CR, CG) ~= nil then
+				local e = data.entity
+				if e.get_signals_changed(CR) or
+				   e.get_signals_changed(CG) then
 					update_messages(data.entity)
 					extra_update[data] = nil
 				end
@@ -423,7 +374,7 @@ local function optimized_message_update()
 	storage.extra_update = {}
 end
 
-script.on_nth_tick(4, poll_displays)
+--script.on_nth_tick(4, poll_displays)
 script.on_event(defines.events.on_tick, optimized_message_update)
 --local PRNT = {skip=defines.print_skip.never, sound=defines.print_sound.never}
 --local p, p2
@@ -465,18 +416,18 @@ end
 local function tick_gui(display)
 	local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
 	if ctrl then
-		for i,m in ipairs(ctrl.messages) do
+		for i,m in ipairs(ctrl.records) do
 			if m.icon and m.icon.type == "virtual" then
 				-- convenience feature: its annoying that when connecting circuit to display panel by default it shows nothing
 				if m.text == nil and m.condition == nil then
 					m.text = "{}"
 					m.condition = ANY_SIGNAL_COND
-					ctrl.set_message(i,m)
+					ctrl.set_record(i,m)
 				end
 			end
 		end
 	end
-	-- ctrl.set_message(i,m) does not actually cause the gui to update
+	-- ctrl.set_record(i,m) does not actually cause the gui to update
 	-- if condition is not already fulfilled or something, this fixes that
 	if not display.display_panel_always_show then
 		display.display_panel_always_show = true
@@ -564,21 +515,15 @@ local function init()
 	end
 end
 
-local _reset_on_load = false
-
 script.on_init(init)
 script.on_configuration_changed(function(data)
 	local changes = data.mod_changes["hexcoder-signal-display"]
-	if changes or _reset_on_load then
-		--local old = changes.old_version
-		--if not old then return end -- on_init already handles existing save
-		
-		-- handle new install, or migration
+	if changes or DEBUG then
 		init()
 	end
 end)
 
-if dbg then
+if DEBUG then
 	local function _reset() -- dev reset
 		for id,_ in pairs(storage.all_displays) do
 			remove_display(id)
