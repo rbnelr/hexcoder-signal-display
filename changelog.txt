@@ -1,4 +1,12 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.2.0
+Date: 21. 10. 2026
+  Optimizations:
+    - Around 40% better performance thanks to change detection via new get_signals_changed() API
+  Bugfixes:
+    - Fixed displays getting stuck sometimes (not updating if API is missing event like wire connect) via polling 1 display per tick
+    - Fixed a crash with blueprint-pasted displays
+---------------------------------------------------------------------------------------------------
 Version: 0.1.2
 Date: 24. 06. 2026
   Bugfixes:
