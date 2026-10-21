@@ -1,5 +1,5 @@
 local mod_name = "hexcoder-signal-display-"
-local DEBUG = true
+local DEBUG = false
 
 ---@type ModStorage
 storage = storage
@@ -20,10 +20,11 @@ local ANY_SIGNAL_COND = { first_signal={type="virtual", name="signal-anything"},
 
 ---@class DisplayData
 ---@field entity LuaEntity
+---@field ctrl LuaDisplayPanelControlBehavior
 ---@field sid surface_index -- surface index, needed to remove display from correct SurfUpdateLists after entity is no longer valid, maybe could be removed lazily?
 ---@field change_tick integer? -- tick of last change
----@field wire1? defines.wire_connector_id
----@field wire2? defines.wire_connector_id
+---@field wire1? defines.wire_connector_id -- first connected wire, red or green
+---@field wire2? defines.wire_connector_id -- second connected wire, always green
 
 ---@class SurfUpdateLists
 ---@field chart DisplayData[]
@@ -44,120 +45,6 @@ local SIGNAL2RICH_TEXT = {
 	["quality"]="quality"
 }
 
--- 2.1 introduced LuaControlBehavior.input_networks but it seems that display panels don't actually give this option to the player so we can ignore it in our code
-
----@param display LuaEntity
----@returns boolean, defines.wire_connector_id?, defines.wire_connector_id?
-local function should_update(display)
-	-- only actually needed in multiplayer, might be overkill
-	for _, player in pairs(game.connected_players) do
-		local open = player.opened_gui_type == defines.gui_type.entity and player.opened --[[@as LuaEntity?]]
-		if display == open then
-			return false
-		end
-	end
-	
-	-- Need to reject unconnected displays or we might inexplicably overwrite user typed message
-	local connR = display.get_circuit_network(CR) and CR
-	local connG = display.get_circuit_network(CG) and CG
-	local wire1 = connR or connG
-	local wire2 = connG
-	
-	local ctrl = wire1 and display.get_control_behavior() or nil --[[@as LuaDisplayPanelControlBehavior]]
-	if ctrl then
-		for _,m in ipairs(ctrl.records) do
-			if m.icon and m.text and m.text:find("{[^{}]*}") then
-				return true, wire1, wire2
-			end
-		end
-	end
-	return false
-end
-
----@param ctrl LuaDisplayPanelControlBehavior
-local function reset_messages(ctrl)
-	for i,m in ipairs(ctrl.records) do
-		if m.text then
-			m.text = m.text:gsub("{[^{}]*}", "{}")
-			ctrl.set_record(i, m)
-		end
-	end
-end
-
--- stop updating, clean messages so user can properly edit, but keep display in all_displays
----@param id unit_number
-local function reset_display(id)
-	local data = storage.all_displays[id]
-	if data then
-		local ctrl = data.entity and data.entity.valid and data.entity.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior]]
-		if ctrl then
-			reset_messages(ctrl)
-		end
-		
-		data.wire1 = nil
-		data.wire2 = nil
-		
-		local surf = storage.surfaces[data.sid]
-		if surf then
-			surf.chart[id] = nil
-			surf.alt[id] = nil
-		end
-		
-		storage.extra_update[data] = nil
-	end
-end
-
--- start or stop updating display depending on if any messages contain format trigger {}
--- and insert or remove from update lists
--- this should be called any time a setting on the display has changed, but due to lack of events for lots of things like undo/redo, blueprinting
--- we are sometimes not calling this, this needs to be fixed either with polling or simply by the player opening the display gui once
----@param display LuaEntity
-local function check_display(display)
-	local id = display.unit_number --[[@as unit_number]]
-	
-	local data = storage.all_displays[id]
-	if not data then
-		script.register_on_object_destroyed(display)
-		
-		data = {
-			entity = display,
-			sid = display.surface_index --[[@as surface_index]],
-			update_tick = 0, -- force update
-		}
-		storage.all_displays[id] = data
-	end
-	
-	local update
-	update, data.wire1, data.wire2 = should_update(display)
-	if update then
-		
-		-- update update lists
-		local surf = storage.surfaces[data.sid] or { chart={}, alt={} }
-		
-		surf.chart[id] = display.display_panel_show_in_chart and data or nil
-		surf.alt[id] = display.display_panel_always_show and data or nil
-		
-		storage.surfaces[data.sid] = surf
-		
-		-- updated_last_tick optimization might not be valid for this display
-		storage.extra_update[data] = true
-		
-		data.update_tick = 0 -- force update
-	else
-		reset_display(id)
-	end
-end
-
----@param id unit_number
-local function remove_display(id)
-	reset_display(id)
-	storage.all_displays[id] = nil
-	storage.opened_guis[id] = nil
-end
-
-local function _comp_signal(l, r)
-	return l.count > r.count
-end
 
 -- draw X over display when it updates
 local function _dbg_update(display)
@@ -168,6 +55,10 @@ local function _dbg_update(display)
 	
 	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y-0.45 }, to={ x=pos.x+0.45, y=pos.y+0.45 }, color={.2,1,.2}, width=2, surface=display.surface, time_to_live=1, render_mode="chart" }
 	rendering.draw_line{ from={ x=pos.x-0.45, y=pos.y+0.45 }, to={ x=pos.x+0.45, y=pos.y-0.45 }, color={.2,1,.2}, width=2, surface=display.surface, time_to_live=1, render_mode="chart" }
+end
+
+local function _comp_signal(l, r)
+	return l.count > r.count
 end
 
 ---@param input string
@@ -260,13 +151,13 @@ local function update_messages(data)
 		return
 	end
 	
-	if DEBUG then _dbg_update(display) end
-	
-	-- cache in case multiple messages exist
-	local all_signals = nil
-	
-	local ctrl = display.get_control_behavior() --[[@as LuaDisplayPanelControlBehavior?]]
-	if ctrl then
+	local ctrl = data.ctrl
+	if ctrl and data.wire1 then
+		if DEBUG then _dbg_update(display) end
+		
+		-- cache in case multiple messages exist
+		local all_signals = nil
+		
 		for i,m in ipairs(ctrl.records) do
 			local icon = m.icon
 			local text = m.text
@@ -311,8 +202,140 @@ local function update_messages(data)
 	end
 end
 
--- this has almost 0.1ms impact, which is bad, but we have to poll to catch certain events
--- TODO: optimize check_display (or pull optimizations from other branch, but beware of bugs)
+-- 2.1 introduced LuaControlBehavior.input_networks but it seems that display panels don't actually give this option to the player so we can ignore it in our code
+
+---@param display LuaEntity
+---@param ctrl LuaDisplayPanelControlBehavior
+---@returns boolean, defines.wire_connector_id?, defines.wire_connector_id?
+local function should_update(display, ctrl)
+	---- only actually needed in multiplayer, might be overkill
+	--for _, player in pairs(game.connected_players) do
+	--	local open = player.opened_gui_type == defines.gui_type.entity and player.opened --[[@as LuaEntity?]]
+	--	if display == open then
+	--		return false
+	--	end
+	--end
+	if storage.opened_guis[display.unit_number] then
+		return false
+	end
+	
+	-- Need to reject unconnected displays or we might inexplicably overwrite user typed message
+	local connR = display.get_circuit_network(CR) and CR
+	local connG = display.get_circuit_network(CG) and CG
+	local wire1 = connR or connG
+	local wire2 = connG
+	
+	if wire1 and ctrl then
+		for _,m in ipairs(ctrl.records) do
+			if m.icon and m.text and m.text:find("{[^{}]*}") then
+				return true, wire1, wire2
+			end
+		end
+	end
+	return false
+end
+
+
+---@param data DisplayData
+local function reset_messages(data)
+	local display = data.entity
+	if display.valid then
+		local ctrl = data.ctrl
+		if ctrl then
+			for i,m in ipairs(ctrl.records) do
+				if m.text then
+					m.text = m.text:gsub("{[^{}]*}", "{}")
+					ctrl.set_record(i, m)
+				end
+			end
+		end
+		
+		-- if wires are connected engine updates entity.display_panel_text
+		--  with the message in LuaDisplayPanelControlBehavior whose condition is true
+		-- but if wire disconnected or user hovers over display, we still run this function
+		-- to avoid confusing "{ <icon> 1 }" despite no wire being connected we clear out the display_panel_text string ourselves
+		-- always as "{}" even if control messages would have generated { 0 } or { <icon> 0 }
+		--reset_display_panel_text(display)
+		display.display_panel_text = display.display_panel_text:gsub("{[^{}]*}", "{}")
+	end
+end
+
+-- stop updating, clean messages so user can properly edit, but keep display in all_displays
+---@param id unit_number
+local function reset_display(id)
+	local data = storage.all_displays[id]
+	if data then
+		reset_messages(data)
+		
+		data.wire1 = nil
+		data.wire2 = nil
+		
+		local surf = storage.surfaces[data.sid]
+		if surf then
+			surf.chart[id] = nil
+			surf.alt[id] = nil
+		end
+		
+		storage.extra_update[data] = nil
+	end
+end
+
+-- start or stop updating display depending on if any messages contain format trigger {}
+-- and insert or remove from update lists
+-- this should be called any time a setting on the display has changed, but due to lack of events for lots of things like undo/redo, blueprinting
+-- we are sometimes not calling this, this needs to be fixed either with polling or simply by the player opening the display gui once
+---@param display LuaEntity
+local function check_display(display)
+	local id = display.unit_number --[[@as unit_number]]
+	
+	local data = storage.all_displays[id]
+	if not data then
+		script.register_on_object_destroyed(display)
+		
+		data = {
+			entity = display,
+			ctrl = display.get_or_create_control_behavior() --[[@as LuaDisplayPanelControlBehavior]],
+			sid = display.surface_index --[[@as surface_index]],
+			update_tick = 0, -- force update
+		}
+		storage.all_displays[id] = data
+	end
+	
+	local update
+	update, data.wire1, data.wire2 = should_update(display, data.ctrl)
+	if update then
+		local surf = storage.surfaces[data.sid]
+		if surf == nil then
+			surf = { chart={}, alt={} }
+			storage.surfaces[data.sid] = surf
+		end
+		
+		-- update update lists
+		surf.chart[id] = display.display_panel_show_in_chart and data or nil
+		surf.alt[id] = display.display_panel_always_show and data or nil
+		
+		-- updated_last_tick optimization might not be valid for this display
+		storage.extra_update[data] = true
+		
+		data.update_tick = 0 -- force update
+	else
+		reset_display(id)
+	end
+	
+	--local surf = storage.surfaces[data.sid]
+	--if surf.chart[id] or surf.alt[id] then
+	--	assert(data.wire1 ~= nil)
+	--end
+end
+
+---@param id unit_number
+local function remove_display(id)
+	reset_display(id)
+	storage.all_displays[id] = nil
+	storage.opened_guis[id] = nil
+end
+
+-- poll 1 per frame, check_display should be optimized
 local function poll_displays()
 	local id, data = next(storage.all_displays, storage.last_polled)
 	if data then
@@ -357,7 +380,9 @@ local function optimized_message_update(event)
 			local e = data.entity
 			local change_tick = data.change_tick
 			local wire2 = data.wire2
+			-- at least 1 wire garantueed to be connected if display is in update list
 			if e.get_signals_changed(data.wire1, change_tick) or
+			    -- only do second get_signals_changed call if 2 wires actually connected
 			   (wire2 and e.get_signals_changed(wire2, change_tick)) then
 				update_messages(data)
 				data.change_tick = cur_tick
@@ -368,6 +393,7 @@ local function optimized_message_update(event)
 	-- handle hovered displays
 	for data, _ in pairs(extra_update) do
 		if cur_tick ~= data.change_tick then
+			-- update even if not connected to wires
 			update_messages(data)
 			data.change_tick = cur_tick
 		end
@@ -376,7 +402,7 @@ local function optimized_message_update(event)
 	storage.extra_update = {}
 end
 
---script.on_nth_tick(4, poll_displays)
+script.on_nth_tick(4, poll_displays)
 script.on_event(defines.events.on_tick, optimized_message_update)
 --local PRNT = {skip=defines.print_skip.never, sound=defines.print_sound.never}
 --local p, p2
@@ -397,7 +423,7 @@ script.on_event(defines.events.on_tick, optimized_message_update)
 --	p2 = p2 or helpers.create_profiler(true)
 --	
 --	p2.restart()
---	optimized_message_update(event.tick)
+--	optimized_message_update(event)
 --	p2.stop()
 --	
 --	if event.tick % 60 == 0 then
@@ -525,24 +551,24 @@ script.on_configuration_changed(function(data)
 	end
 end)
 
-if DEBUG then
-	local function _reset() -- dev reset
-		for id,_ in pairs(storage.all_displays) do
-			remove_display(id)
-		end
-		
-		for _, s in pairs(game.surfaces) do
-			for _, name in pairs({"hidden-change-detector"}) do
-				for _, e in pairs(s.find_entities_filtered{ name=mod_name..name }) do
-					e.destroy()
-				end
-			end
-		end
-		
-		init()
-	end
-	-- removed to not clutter up /help
-	commands.add_command("hexcoder-signal-display-reset", nil, function(command)
-		_reset()
-	end)
-end
+--if DEBUG then
+--	local function _reset() -- dev reset
+--		for id,_ in pairs(storage.all_displays) do
+--			remove_display(id)
+--		end
+--		
+--		for _, s in pairs(game.surfaces) do
+--			for _, name in pairs({"hidden-change-detector"}) do
+--				for _, e in pairs(s.find_entities_filtered{ name=mod_name..name }) do
+--					e.destroy()
+--				end
+--			end
+--		end
+--		
+--		init()
+--	end
+--	-- removed to not clutter up /help
+--	commands.add_command("hexcoder-signal-display-reset", nil, function(command)
+--		_reset()
+--	end)
+--end
